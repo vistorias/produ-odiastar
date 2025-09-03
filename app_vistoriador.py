@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 # ------------------------------------------------------------
 # Painel de Produção por Vistoriador (Streamlit) - versão visual (emojis)
-# - Filtros reativos
-# - Cartões: Vistorias (geral), Vistorias líquidas, Revistorias, % Revistorias
-# - Remove "POSTO CÓDIGO" e unidades vazias
-# - Ranking mensal (TOP BOX / BOTTOM BOX) por FIXO e MÓVEL
-# - Ranking do dia (TOP/BOTTOM) por FIXO e MÓVEL
+# Lê TODAS as planilhas de uma pasta do Drive (sheet1) e concatena
+# Mantém filtros, KPIs, gráficos e rankings (mensal e do dia)
 # ------------------------------------------------------------
 
 import os, json
@@ -55,11 +52,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================
-# Conexão Google Sheets
+# 🔧 Config da Pasta do Drive
 # =========================
-SHEET_ID = "14Bm5H9C20LqABklE3FniGjKM4-angZQ2fPRV7Uqm0GI"
+# 👉 COLE AQUI o ID da pasta do Drive onde ficam as planilhas mensais
+FOLDER_ID = "COLOQUE_O_ID_DA_SUA_PASTA_AQUI"
+# Deixe SHEET_ID = None para usar a pasta (não usado nesta versão)
+SHEET_ID = None
+
 SERVICE_EMAIL = None
 
+# =========================
+# Autenticação & helpers
+# =========================
 def _load_sa_info():
     try:
         block = st.secrets["gcp_service_account"]
@@ -84,7 +88,7 @@ def _load_sa_info():
             st.stop()
     return dict(block), "dict"
 
-def conectar_gsheets(sheet_id: str):
+def _auth_client():
     global SERVICE_EMAIL
     info, _ = _load_sa_info()
     SERVICE_EMAIL = info.get("client_email", "(sem client_email)")
@@ -92,40 +96,101 @@ def conectar_gsheets(sheet_id: str):
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
-    try:
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
-        client = gspread.authorize(creds)
-        sh = client.open_by_key(sheet_id)
-        ws = sh.sheet1
-        data = ws.get_all_records()
-        df = pd.DataFrame(data)
-        return ws, df
-    except Exception as e:
-        st.error("Não consegui ler a planilha.")
-        st.info(f"Compartilhe com: **{SERVICE_EMAIL}** (Leitor/Editor).")
-        with st.expander("Erro ao abrir a planilha"):
-            st.exception(e)
-        st.stop()
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
+    return gspread.authorize(creds)
 
-st.markdown("#### Conexão com a Base — Planilha de Produção por Vistoriador")
-ws, df_raw = conectar_gsheets(SHEET_ID)
-st.success("✅ Conectado à planilha com sucesso.")
+def _list_spreadsheets_in_folder(client, folder_id: str):
+    # lista só Google Sheets na pasta
+    q = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
+    return client.list_spreadsheet_files(query=q) or []
+
+# =========================
+# Carregar TODAS as planilhas da pasta e concatenar
+# =========================
+@st.cache_data(ttl=600, show_spinner=False)
+def carregar_da_pasta(folder_id: str):
+    """
+    Retorna:
+    - df_all: DataFrame concatenado de todas as planilhas (sheet1) da pasta
+    - df_metas: DataFrame da aba METAS do arquivo mais recente (ou None)
+    - info_files: lista de dicts com 'name', 'id', 'modifiedTime' dos arquivos lidos
+    """
+    client = _auth_client()
+    files = _list_spreadsheets_in_folder(client, folder_id)
+    if not files:
+        raise RuntimeError("Não encontrei planilhas na pasta.")
+
+    # Ordena por data de modificação (descendente)
+    files_sorted = sorted(files, key=lambda f: f.get("modifiedTime", ""), reverse=True)
+
+    # Concatena dados de todas (sheet1)
+    lot = []
+    lidos = []
+    pulados = []
+
+    for f in files_sorted:
+        try:
+            sh = client.open_by_key(f["id"])
+            ws = sh.sheet1
+            data = ws.get_all_records()
+            if not data:
+                continue
+            df_part = pd.DataFrame(data)
+            df_part["__ARQUIVO__"] = f.get("name", "")
+            df_part["__FILE_ID__"] = f.get("id", "")
+            lot.append(df_part)
+            lidos.append(f.get("name", ""))
+        except Exception as e:
+            pulados.append((f.get("name",""), str(e)))
+
+    df_all = pd.concat(lot, ignore_index=True, sort=False) if lot else pd.DataFrame()
+
+    # Tenta ler a METAS do arquivo mais recente que possua essa worksheet
+    df_metas = None
+    for f in files_sorted:
+        try:
+            sh = client.open_by_key(f["id"])
+            metas_ws = sh.worksheet("METAS")
+            metas_data = metas_ws.get_all_records()
+            df_metas = pd.DataFrame(metas_data) if metas_data else pd.DataFrame()
+            break
+        except Exception:
+            continue
+
+    return df_all, df_metas, files_sorted, lidos, pulados
+
+# =========================
+# Conexão / leitura
+# =========================
+st.markdown("#### Conexão com a Base — Planilhas na Pasta do Drive")
+try:
+    df_raw, df_metas_raw, files_sorted, lidos, pulados = carregar_da_pasta(FOLDER_ID)
+    nomes = [f["name"] for f in files_sorted]
+    if lidos:
+        shown = ", ".join(lidos[:5]) + (" …" if len(lidos) > 5 else "")
+        st.success(f"✅ {len(lidos)} planilhas lidas da pasta. Exemplos: {shown}")
+    if pulados:
+        with st.expander("⚠️ Arquivos ignorados (erro na leitura)"):
+            for nm, msg in pulados:
+                st.write(f"- {nm}: {msg}")
+except Exception as e:
+    st.error("Não consegui ler as planilhas da pasta.")
+    st.info(f"Compartilhe a pasta com: **{SERVICE_EMAIL}** (Leitor/Editor).")
+    with st.expander("Detalhes do erro"):
+        st.exception(e)
+    st.stop()
 
 # ==== helpers reutilizados ====
 def _upper_strip(x):
     return str(x).upper().strip() if pd.notna(x) else ""
 
-# --- Lê a aba METAS (opcional) ---
-def ler_aba_metas(worksheet_handle) -> pd.DataFrame | None:
-    try:
-        metas_ws = worksheet_handle.spreadsheet.worksheet("METAS")
-    except Exception:
+# --- Lê/normaliza METAS (se veio de alguma planilha)
+def normalizar_metas(df_metas_raw: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df_metas_raw is None:
         return None
-
-    metas = pd.DataFrame(metas_ws.get_all_records())
+    metas = df_metas_raw.copy()
     if metas.empty:
         return metas
-
     metas.columns = [c.strip().upper() for c in metas.columns]
     ren = {}
     for cand in ["META_MENSAL", "META MEN SAL", "META_MEN SAL", "META_MEN.SAL", "META MENSA"]:
@@ -143,7 +208,7 @@ def ler_aba_metas(worksheet_handle) -> pd.DataFrame | None:
     metas["DIAS_UTEIS"]  = pd.to_numeric(metas.get("DIAS_UTEIS", 0),  errors="coerce").fillna(0).astype(int)
     return metas
 
-df_metas = ler_aba_metas(ws)
+df_metas = normalizar_metas(df_metas_raw)
 
 # =========================
 # Limpeza e padronização
@@ -158,6 +223,9 @@ def parse_date_any(x):
     except: return pd.NaT
 
 df = df_raw.copy()
+if df.empty:
+    st.info("A pasta foi lida, mas não há linhas de dados nas planilhas (sheet1).")
+# padroniza cabeçalhos
 df.columns = [c.strip().upper() for c in df.columns]
 
 col_unid  = "UNIDADE"   if "UNIDADE"   in df.columns else None
@@ -168,9 +236,10 @@ col_digit = "DIGITADOR" if "DIGITADOR" in df.columns else None
 
 required = [col_unid, col_data, col_chassi, (col_perito or col_digit)]
 if any(c is None for c in required):
-    st.error("A planilha precisa conter as colunas: UNIDADE, DATA, CHASSI, PERITO/DIGITADOR.")
+    st.error("As planilhas precisam conter as colunas: UNIDADE, DATA, CHASSI, PERITO/DIGITADOR.")
     st.stop()
 
+# Normalizar
 df[col_unid]   = df[col_unid].map(_upper_strip)
 df[col_chassi] = df[col_chassi].map(_upper_strip)
 df["__DATA__"] = df[col_data].apply(parse_date_any)
@@ -192,7 +261,7 @@ df = df.sort_values(["__DATA__", col_chassi], kind="mergesort").reset_index(drop
 df["__ORD__"] = df.groupby(col_chassi).cumcount()
 df["IS_REV"] = (df["__ORD__"] >= 1).astype(int)
 
-# Remover "POSTO CÓDIGO/CODIGO" e valores vazios de unidade
+# Remover "POSTO CÓDIGO/CODIGO" e valores vazios
 BAN_UNIDS = {"POSTO CÓDIGO", "POSTO CODIGO", "CÓDIGO", "CODIGO", "", "—", "NAN"}
 df = df[~df[col_unid].isin(BAN_UNIDS)].copy()
 
@@ -245,8 +314,11 @@ datas_validas = [d for d in df["__DATA__"] if isinstance(d, date)]
 dmin = min(datas_validas) if datas_validas else date.today()
 dmax = max(datas_validas) if datas_validas else date.today()
 
+# Defaults de datas na Session State
 if "dt_ini" not in st.session_state:
-    st.session_state["dt_ini"] = dmin
+    # por padrão, começo do mês atual
+    today = date.today()
+    st.session_state["dt_ini"] = date(today.year, today.month, 1)
 if "dt_fim" not in st.session_state:
     st.session_state["dt_fim"] = dmax
 
@@ -269,6 +341,12 @@ with colV2:
     b3.button("Selecionar todos", use_container_width=True, on_click=cb_sel_all_vists)
     b4.button("Limpar", use_container_width=True, on_click=cb_clear_vists)
 
+# Botão para renovar o cache (recarregar pasta)
+st.caption(" ")
+if st.button("🔄 Atualizar dados da pasta (recarregar)"):
+    carregar_da_pasta.clear()  # limpa cache
+    st.experimental_rerun()
+
 # =========================
 # Aplicar filtros aos dados
 # =========================
@@ -282,6 +360,7 @@ if st.session_state.vists_tmp:
 
 if view.empty:
     st.info("Nenhum registro para os filtros aplicados.")
+
 # =========================
 # KPIs (cartões)
 # =========================
