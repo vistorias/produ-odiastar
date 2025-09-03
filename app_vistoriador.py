@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 # ------------------------------------------------------------
 # Painel de Produção por Vistoriador (Streamlit) - versão visual (emojis)
-# - Filtros reativos
-# - Cartões: Vistorias (geral), Vistorias líquidas, Revistorias, % Revistorias
-# - Remove "POSTO CÓDIGO" e unidades vazias
-# - Ranking mensal (TOP BOX / BOTTOM BOX) por FIXO e MÓVEL
-# - Ranking do dia (TOP/BOTTOM) por FIXO e MÓVEL
+# - Lê planilhas de uma PASTA do Google Drive (pode colar ID ou URL)
+# - Seleciona o arquivo (mês) no selectbox
+# - Mantém filtros reativos, KPIs, gráficos, rankings mensal e do dia
+# - Fixes para sábados/domingos e merges seguros
 # ------------------------------------------------------------
 
-import os, json
+import os, json, re, requests
 from datetime import datetime, date
 
 import streamlit as st
@@ -55,12 +54,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================
-# Conexão Google Sheets
+# PASTA DO DRIVE (ID ou URL)
 # =========================
-SHEET_ID = "14Bm5H9C20LqABklE3FniGjKM4-angZQ2fPRV7Uqm0GI"
-SERVICE_EMAIL = None
+# 👉 Cole aqui o ID OU a URL da pasta no Drive:
+FOLDER_ID = "https://drive.google.com/drive/folders/1rDeXts0WRA-lvx_FhqottTPEYf3Iqsql"
+SERVICE_EMAIL = None  # será preenchido ao carregar as credenciais
 
+# =========================
+# Autenticação & helpers
+# =========================
 def _load_sa_info():
+    """Carrega credenciais do Service Account de st.secrets['gcp_service_account']."""
     try:
         block = st.secrets["gcp_service_account"]
     except Exception as e:
@@ -84,7 +88,52 @@ def _load_sa_info():
             st.stop()
     return dict(block), "dict"
 
+def _resolve_folder_id(val: str | None) -> str | None:
+    """Aceita ID OU URL da pasta e devolve só o ID."""
+    if not val:
+        return None
+    s = str(val).strip()
+    m = re.search(r'/folders/([a-zA-Z0-9_-]+)', s)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r'[a-zA-Z0-9_-]{10,}', s):
+        return s
+    return None
+
+def listar_planilhas_da_pasta(folder_id: str) -> list[dict]:
+    """
+    Lista Google Sheets dentro da pasta usando a API do Drive.
+    Retorna lista de dicts: {id, name, modifiedTime, createdTime}.
+    """
+    info, _ = _load_sa_info()
+    scopes = [
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
+    # pega access token
+    token = creds.get_access_token().access_token
+
+    fid = _resolve_folder_id(folder_id)
+    if not fid:
+        raise RuntimeError("FOLDER_ID inválido. Cole o ID OU a URL da pasta do Drive.")
+
+    url = "https://www.googleapis.com/drive/v3/files"
+    params = {
+        "q": f"'{fid}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+        "fields": "files(id,name,modifiedTime,createdTime)",
+        "orderBy": "modifiedTime desc",
+        "pageSize": 1000,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+    }
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(url, params=params, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.json().get("files", [])
+
 def conectar_gsheets(sheet_id: str):
+    """Conecta em uma planilha (sheet_id) e devolve (worksheet sheet1, dataframe)."""
     global SERVICE_EMAIL
     info, _ = _load_sa_info()
     SERVICE_EMAIL = info.get("client_email", "(sem client_email)")
@@ -107,9 +156,41 @@ def conectar_gsheets(sheet_id: str):
             st.exception(e)
         st.stop()
 
-st.markdown("#### Conexão com a Base — Planilha de Produção por Vistoriador")
-ws, df_raw = conectar_gsheets(SHEET_ID)
-st.success("✅ Conectado à planilha com sucesso.")
+# =========================
+# Conexão / escolha do mês (arquivo da pasta)
+# =========================
+st.markdown("#### Conexão com a Base — Planilhas na Pasta do Drive")
+
+try:
+    # só para popular SERVICE_EMAIL na mensagem de ajuda
+    _info, _ = _load_sa_info()
+    SERVICE_EMAIL = _info.get("client_email", "(sem client_email)")
+
+    arquivos = listar_planilhas_da_pasta(FOLDER_ID)
+    if not arquivos:
+        raise RuntimeError("Não encontrei Google Sheets na pasta (confira permissões e se não são atalhos).")
+
+    # Selectbox para escolher o arquivo (mês). Default = mais recente.
+    opcoes = [f"{a['modifiedTime'][:10]} — {a['name']}" for a in arquivos]
+    idx_default = 0
+    escolha = st.selectbox("Arquivo (mês) da pasta", opcoes, index=idx_default)
+    escolhido = arquivos[opcoes.index(escolha)]
+
+    SHEET_ID = escolhido["id"]
+    ws, df_raw = conectar_gsheets(SHEET_ID)
+    st.success(f"✅ Conectado: {escolhido['name']} (modificado em {escolhido['modifiedTime'][:10]})")
+
+except Exception as e:
+    st.error("Não consegui ler as planilhas da pasta.")
+    st.info(
+        "Verifique:\n"
+        "1) Se o FOLDER_ID é o ID ou a URL da pasta;\n"
+        f"2) Se a pasta está compartilhada com **{SERVICE_EMAIL}** (Leitor/Editor);\n"
+        "3) Se os arquivos são **Google Sheets** (não atalhos)."
+    )
+    with st.expander("Detalhes do erro"):
+        st.exception(e)
+    st.stop()
 
 # ==== helpers reutilizados ====
 def _upper_strip(x):
@@ -117,6 +198,7 @@ def _upper_strip(x):
 
 # --- Lê a aba METAS (opcional) ---
 def ler_aba_metas(worksheet_handle) -> pd.DataFrame | None:
+    """Tenta ler a worksheet 'METAS' da planilha escolhida."""
     try:
         metas_ws = worksheet_handle.spreadsheet.worksheet("METAS")
     except Exception:
@@ -171,6 +253,7 @@ if any(c is None for c in required):
     st.error("A planilha precisa conter as colunas: UNIDADE, DATA, CHASSI, PERITO/DIGITADOR.")
     st.stop()
 
+# Normalizar
 df[col_unid]   = df[col_unid].map(_upper_strip)
 df[col_chassi] = df[col_chassi].map(_upper_strip)
 df["__DATA__"] = df[col_data].apply(parse_date_any)
@@ -269,6 +352,10 @@ with colV2:
     b3.button("Selecionar todos", use_container_width=True, on_click=cb_sel_all_vists)
     b4.button("Limpar", use_container_width=True, on_click=cb_clear_vists)
 
+if st.button("🔄 Atualizar dados da pasta (recarregar)"):
+    st.cache_data.clear()
+    st.rerun()
+
 # =========================
 # Aplicar filtros aos dados
 # =========================
@@ -282,6 +369,7 @@ if st.session_state.vists_tmp:
 
 if view.empty:
     st.info("Nenhum registro para os filtros aplicados.")
+
 # =========================
 # KPIs (cartões)
 # =========================
@@ -299,7 +387,7 @@ cards = [
 
 st.markdown(
     '<div class="card-container">' +
-    "".join([f"<div class='card'><h4>{t}</h4><h2>{v}</h2></div>" for t, v in cards]) +
+    "".join([f"<div class=\'card\'><h4>{t}</h4><h2>{v}</h2></div>" for t, v in cards]) +
     "</div>", unsafe_allow_html=True
 )
 
@@ -702,12 +790,14 @@ else:
 
     view_dia = view[view["__DATA__"] == used_day].copy()
 
+    # produção do dia por vistoriador
     prod_dia = (view_dia.groupby("VISTORIADOR", dropna=False)
                 .agg(VISTORIAS_DIA=("IS_REV", "size"),
                      REVISTORIAS_DIA=("IS_REV", "sum"))
                 .reset_index())
     prod_dia["LIQUIDO_DIA"] = prod_dia["VISTORIAS_DIA"] - prod_dia["REVISTORIAS_DIA"]
 
+    # metas (para META_DIA) vindas da aba METAS
     if (df_metas is not None) and len(df_metas):
         metas_join = df_metas[["VISTORIADOR", "TIPO", "META_MENSAL", "DIAS_UTEIS"]].copy()
     else:
@@ -747,6 +837,7 @@ else:
 
         rk = rk.sort_values("ATING_DIA_%", ascending=False)
 
+        # TOP 5
         top = rk.head(5).copy()
         medals = ["🥇", "🥈", "🥉", "🏅", "🏅"]
         top["🏅"] = [medals[i] if i < len(medals) else "🏅" for i in range(len(top))]
@@ -760,6 +851,7 @@ else:
             "% Ating. (dia)": top["ATING_DIA_%"].map(chip_pct_row_dia),
         })
 
+        # BOTTOM 5
         bot = rk.tail(5).sort_values("ATING_DIA_%", ascending=True).copy()
         badgies = ["🆘", "🪫", "🐢", "⚠️", "⚠️"]
         bot["⚠️"] = [badgies[i] if i < len(badgies) else "⚠️" for i in range(len(bot))]
@@ -786,4 +878,3 @@ else:
 
     st.markdown("#### 🚗 MÓVEL")
     render_ranking_dia(base_dia[base_dia["TIPO"].isin(["MÓVEL", "MOVEL"])], "vistoriadores MÓVEL")
-
