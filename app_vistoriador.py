@@ -55,7 +55,7 @@ st.markdown("""
 # 🔧 Config da Pasta do Drive
 # =========================
 # 👉 COLE AQUI o ID **ou a URL** da pasta do Drive onde ficam as planilhas mensais
-FOLDER_ID = "1rDeXts0WRA-lvx_FhqottTPEYf3Iqsql"
+FOLDER_ID = "https://drive.google.com/drive/u/0/folders/1rDeXts0WRA-lvx_FhqottTPEYf3Iqsql"
 SHEET_ID = None  # não usado nesta versão (tudo vem da pasta)
 SERVICE_EMAIL = None
 
@@ -914,3 +914,4 @@ else:
 
     st.markdown("#### 🚗 MÓVEL")
     render_ranking_dia(base_dia[base_dia["TIPO"].isin(["MÓVEL", "MOVEL"])], "vistoriadores MÓVEL")
+
