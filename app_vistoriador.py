@@ -207,8 +207,6 @@ df = df[~df[col_unid].isin(BAN_UNIDS)].copy()
 def _init_state():
     st.session_state.setdefault("unids_tmp", [])
     st.session_state.setdefault("vists_tmp", [])
-    st.session_state.setdefault("dt_ini", None)
-    st.session_state.setdefault("dt_fim", None)
 _init_state()
 
 unidades_opts = sorted([u for u in df[col_unid].dropna().unique()])
@@ -252,11 +250,18 @@ with colU2:
 datas_validas = [d for d in df["__DATA__"] if isinstance(d, date)]
 dmin = min(datas_validas) if datas_validas else date.today()
 dmax = max(datas_validas) if datas_validas else date.today()
+
+# Defaults de datas na Session State (sem passar value= no widget)
+if "dt_ini" not in st.session_state:
+    st.session_state["dt_ini"] = dmin
+if "dt_fim" not in st.session_state:
+    st.session_state["dt_fim"] = dmax
+
 colD1, colD2 = st.columns(2)
 with colD1:
-    di = st.date_input("Data inicial", st.session_state.dt_ini or dmin, format="DD/MM/YYYY", key="dt_ini")
+    st.date_input("Data inicial", key="dt_ini", format="DD/MM/YYYY")
 with colD2:
-    dfi = st.date_input("Data final", st.session_state.dt_fim or dmax, format="DD/MM/YYYY", key="dt_fim")
+    st.date_input("Data final", key="dt_fim", format="DD/MM/YYYY")
 
 colV1, colV2 = st.columns([4,2])
 with colV1:
@@ -566,7 +571,7 @@ else:
     ]
     st.markdown(
         '<div class="card-container">' +
-        "".join([f"<div class='card'><h4>{t}</h4><h2>{v}</h2></div>" for t, v in cards_mes]) +
+        "".join([f"<div class=\'card\'><h4>{t}</h4><h2>{v}</h2></div>" for t, v in cards_mes]) +
         "</div>", unsafe_allow_html=True
     )
 
@@ -694,7 +699,7 @@ else:
     else:
         metas_join = pd.DataFrame(columns=["VISTORIADOR", "TIPO", "META_MENSAL", "DIAS_UTEIS"])
 
-    base_dia = prod_dia.merge(metas_join, on="VISTORIADOR", how="left")
+    base_dia = prod_dia.merge(metas_join, on("VISTORIADOR"), how="left")
     base_dia["TIPO"] = base_dia["TIPO"].astype(str).str.upper().replace({"MOVEL": "MÓVEL"}).replace("", "—")
     for c in ["META_MENSAL", "DIAS_UTEIS"]:
         base_dia[c] = pd.to_numeric(base_dia.get(c, 0), errors="coerce").fillna(0)
