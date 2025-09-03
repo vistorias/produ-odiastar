@@ -5,6 +5,7 @@
 # - Cartões: Vistorias (geral), Vistorias líquidas, Revistorias, % Revistorias
 # - Remove "POSTO CÓDIGO" e unidades vazias
 # - Ranking mensal (TOP BOX / BOTTOM BOX) por FIXO e MÓVEL
+# - Ranking do dia (TOP/BOTTOM) por FIXO e MÓVEL
 # ------------------------------------------------------------
 
 import os, json
@@ -27,7 +28,6 @@ st.title("🧰 Painel de Produção por Vistoriador - Starcheck")
 # --- proteção contra auto-tradução do navegador (Chrome/Edge) ---
 st.markdown("""
 <style>
-  /* qualquer coisa dentro deste span não deve ser traduzida */
   .notranslate { unicode-bidi: plaintext; }
   .hero { background-color:#f0f2f6; padding:15px; border-radius:12px; margin-bottom:18px; box-shadow:0 1px 3px rgba(0,0,0,.10); }
   .card-container { display:flex; gap:18px; margin:12px 0 22px; flex-wrap:wrap; }
@@ -40,7 +40,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 def _nt(txt: str) -> str:
-    """Envolve um texto em <span class='notranslate' translate='no'>...</span>"""
     return f"<span class='notranslate' translate='no'>{txt}</span>"
 
 st.markdown("""
@@ -118,7 +117,6 @@ def _upper_strip(x):
 
 # --- Lê a aba METAS (opcional) ---
 def ler_aba_metas(worksheet_handle) -> pd.DataFrame | None:
-    """Tenta ler a worksheet 'METAS' e normaliza os nomes de colunas."""
     try:
         metas_ws = worksheet_handle.spreadsheet.worksheet("METAS")
     except Exception:
@@ -128,7 +126,6 @@ def ler_aba_metas(worksheet_handle) -> pd.DataFrame | None:
     if metas.empty:
         return metas
 
-    # padroniza cabeçalhos
     metas.columns = [c.strip().upper() for c in metas.columns]
     ren = {}
     for cand in ["META_MENSAL", "META MEN SAL", "META_MEN SAL", "META_MEN.SAL", "META MENSA"]:
@@ -137,7 +134,6 @@ def ler_aba_metas(worksheet_handle) -> pd.DataFrame | None:
         if cand in metas.columns: ren[cand] = "DIAS_UTEIS"
     metas = metas.rename(columns=ren)
 
-    # normaliza valores
     metas["VISTORIADOR"] = metas["VISTORIADOR"].map(_upper_strip)
     if "UNIDADE" in metas.columns:
         metas["UNIDADE"] = metas["UNIDADE"].astype(str).map(_upper_strip)
@@ -175,7 +171,6 @@ if any(c is None for c in required):
     st.error("A planilha precisa conter as colunas: UNIDADE, DATA, CHASSI, PERITO/DIGITADOR.")
     st.stop()
 
-# Normalizar
 df[col_unid]   = df[col_unid].map(_upper_strip)
 df[col_chassi] = df[col_chassi].map(_upper_strip)
 df["__DATA__"] = df[col_data].apply(parse_date_any)
@@ -192,12 +187,12 @@ elif col_perito:
 else:
     df["VISTORIADOR"] = df[col_digit].map(_upper_strip)
 
-# Revistoria (ordem por data + chassi)
+# Revistoria
 df = df.sort_values(["__DATA__", col_chassi], kind="mergesort").reset_index(drop=True)
 df["__ORD__"] = df.groupby(col_chassi).cumcount()
 df["IS_REV"] = (df["__ORD__"] >= 1).astype(int)
 
-# Remover "POSTO CÓDIGO/CODIGO" e valores vazios de unidade
+# Remover "POSTO CÓDIGO/CODIGO" e valores vazios
 BAN_UNIDS = {"POSTO CÓDIGO", "POSTO CODIGO", "CÓDIGO", "CODIGO", "", "—", "NAN"}
 df = df[~df[col_unid].isin(BAN_UNIDS)].copy()
 
@@ -251,7 +246,6 @@ datas_validas = [d for d in df["__DATA__"] if isinstance(d, date)]
 dmin = min(datas_validas) if datas_validas else date.today()
 dmax = max(datas_validas) if datas_validas else date.today()
 
-# Defaults de datas na Session State (sem passar value= no widget)
 if "dt_ini" not in st.session_state:
     st.session_state["dt_ini"] = dmin
 if "dt_fim" not in st.session_state:
@@ -292,7 +286,7 @@ if st.session_state.vists_tmp:
 # KPIs (cartões)
 # =========================
 vistorias_total   = int(len(view))
-revistorias_total = int(view["IS_REV"].sum())
+revistorias_total = int(view["IS_REV"].sum()) if not view.empty else 0
 liq_total         = int(vistorias_total - revistorias_total)
 pct_rev           = (100 * revistorias_total / vistorias_total) if vistorias_total else 0.0
 
@@ -314,7 +308,6 @@ st.markdown(
 # =========================
 st.markdown("<div class='section-title'>📋 Resumo por Vistoriador</div>", unsafe_allow_html=True)
 
-# base agregada do que já foi realizado no período filtrado
 grp = (view
        .groupby("VISTORIADOR", dropna=False)
        .agg(
@@ -327,13 +320,23 @@ grp = (view
 
 grp["LIQUIDO"]  = grp["VISTORIAS"] - grp["REVISTORIAS"]
 
-# ---- dias úteis passados por vistoriador (conta somente seg–sex presentes no filtro)
+# ---- dias úteis passados por vistoriador (robusto p/ dataset vazio)
 def _is_workday(d):
     return isinstance(d, date) and d.weekday() < 5
 
-wd_passados = (view[view["__DATA__"].apply(_is_workday)]
-               .groupby("VISTORIADOR")["__DATA__"].nunique()
-               .rename("DIAS_PASSADOS"))
+def _calc_wd_passados(df_view: pd.DataFrame) -> pd.Series:
+    if df_view.empty or "__DATA__" not in df_view.columns or "VISTORIADOR" not in df_view.columns:
+        return pd.Series(dtype=int, name="DIAS_PASSADOS")
+    mask = df_view["__DATA__"].apply(_is_workday)
+    if not mask.any():
+        return pd.Series(dtype=int, name="DIAS_PASSADOS")
+    return (df_view.loc[mask]
+            .groupby("VISTORIADOR")["__DATA__"]
+            .nunique()
+            .astype(int)
+            .rename("DIAS_PASSADOS"))
+
+wd_passados = _calc_wd_passados(view)
 grp = grp.merge(wd_passados, on="VISTORIADOR", how="left")
 grp["DIAS_PASSADOS"] = grp["DIAS_PASSADOS"].fillna(0).astype(int)
 
@@ -342,7 +345,6 @@ if df_metas is not None and len(df_metas):
     metas_cols = [c for c in ["VISTORIADOR", "UNIDADE", "TIPO", "META_MENSAL", "DIAS_UTEIS"] if c in df_metas.columns]
     grp = grp.merge(df_metas[metas_cols], on="VISTORIADOR", how="left")
 
-    # saneamento pós-merge
     grp["UNIDADE"] = grp.get("UNIDADE", "").fillna("")
     grp["TIPO"]     = grp.get("TIPO", "").fillna("")
     for c in ["META_MENSAL", "DIAS_UTEIS"]:
@@ -358,14 +360,11 @@ else:
 # ---- cálculos de meta/dia, faltante, necessidade/dia, projeção e tendência
 grp["META_DIA"] = np.where(grp["DIAS_UTEIS"]>0, grp["META_MENSAL"]/grp["DIAS_UTEIS"], 0.0)
 grp["FALTANTE_MES"] = np.maximum(grp["META_MENSAL"] - grp["LIQUIDO"], 0)
-
 grp["DIAS_RESTANTES"] = np.maximum(grp["DIAS_UTEIS"] - grp["DIAS_PASSADOS"], 0)
 grp["NECESSIDADE_DIA"] = np.where(grp["DIAS_RESTANTES"]>0,
                                   grp["FALTANTE_MES"]/grp["DIAS_RESTANTES"], 0.0)
-
 grp["MEDIA_DIA_ATUAL"] = np.where(grp["DIAS_PASSADOS"]>0, grp["LIQUIDO"]/grp["DIAS_PASSADOS"], 0.0)
 
-# --- saneamento antes da projeção ---
 for c in ["LIQUIDO", "MEDIA_DIA_ATUAL", "DIAS_RESTANTES"]:
     grp[c] = pd.to_numeric(grp[c], errors="coerce")
 
@@ -379,7 +378,7 @@ grp["TENDENCIA_%"] = np.where(grp["META_MENSAL"]>0, (grp["PROJECAO_MES"]/grp["ME
 # ---- ordenação
 grp = grp.sort_values(["PROJECAO_MES","LIQUIDO"], ascending=[False, False])
 
-# ---- formatação para exibir (com emojis) ----
+# ---- formatação (com emojis)
 fmt = grp.copy()
 
 def chip_tend(p):
@@ -407,7 +406,7 @@ fmt["LIQUIDO"]          = fmt["LIQUIDO"].map(lambda x: f"{int(x)}")
 fmt["FALTANTE_MES"]     = fmt["FALTANTE_MES"].map(lambda x: f"{int(x)}")
 fmt["NECESSIDADE_DIA"]  = grp["NECESSIDADE_DIA"].apply(chip_nec)
 fmt["TENDÊNCIA"]        = grp["TENDENCIA_%"].apply(chip_tend)
-fmt["PROJECAO_MES"]     = grp["PROJECAO_MES"].map(lambda x: "—" if pd.isna(x) else f"{int(round(x))}")
+fmt["PROJECAO_MES"]     = fmt["PROJECAO_MES"].map(lambda x: "—" if pd.isna(x) else f"{int(round(x))}")
 
 cols_show = [
     "VISTORIADOR", "UNIDADE", "TIPO",
@@ -415,90 +414,107 @@ cols_show = [
     "VISTORIAS", "REVISTORIAS", "LIQUIDO",
     "FALTANTE_MES", "NECESSIDADE_DIA", "TENDÊNCIA", "PROJECAO_MES"
 ]
-st.dataframe(fmt[cols_show], use_container_width=True, hide_index=True)
 
-# download do CSV
-csv = fmt[cols_show].to_csv(index=False).encode("utf-8-sig")
-st.download_button("⬇️ Baixar resumo (CSV)", data=csv, file_name="resumo_vistoriador.csv", mime="text/csv")
+if fmt.empty:
+    st.caption("Sem registros para os filtros aplicados.")
+else:
+    st.dataframe(fmt[cols_show], use_container_width=True, hide_index=True)
+    csv = fmt[cols_show].to_csv(index=False).encode("utf-8-sig")
+    st.download_button("⬇️ Baixar resumo (CSV)", data=csv, file_name="resumo_vistoriador.csv", mime="text/csv")
 
 # =========================
 # Evolução diária
 # =========================
 st.markdown("<div class='section-title'>📈 Evolução diária</div>", unsafe_allow_html=True)
 
-daily = (view
-         .groupby("__DATA__", dropna=False)
-         .agg(VISTORIAS=("IS_REV","size"),
-              REVISTORIAS=("IS_REV","sum"))
-         .reset_index())
-daily = daily[pd.notna(daily["__DATA__"])].sort_values("__DATA__")
-daily["LIQUIDO"] = daily["VISTORIAS"] - daily["REVISTORIAS"]
+if view.empty:
+    st.caption("Sem dados no período selecionado.")
+else:
+    daily = (view
+             .groupby("__DATA__", dropna=False)
+             .agg(VISTORIAS=("IS_REV","size"),
+                  REVISTORIAS=("IS_REV","sum"))
+             .reset_index())
+    daily = daily[pd.notna(daily["__DATA__"])].sort_values("__DATA__")
+    daily["LIQUIDO"] = daily["VISTORIAS"] - daily["REVISTORIAS"]
 
-daily_melt = daily.melt(id_vars="__DATA__", value_vars=["VISTORIAS","REVISTORIAS","LIQUIDO"],
-                        var_name="Métrica", value_name="Valor")
+    daily_melt = daily.melt(id_vars="__DATA__", value_vars=["VISTORIAS","REVISTORIAS","LIQUIDO"],
+                            var_name="Métrica", value_name="Valor")
 
-line = (alt.Chart(daily_melt)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("__DATA__:T", title="Data"),
-            y=alt.Y("Valor:Q", title="Quantidade"),
-            color=alt.Color("Métrica:N", title="Métrica"),
-            tooltip=[alt.Tooltip("__DATA__:T", title="Data"),
-                     alt.Tooltip("Métrica:N", title="Métrica"),
-                     alt.Tooltip("Valor:Q", title="Valor")]
-        )
-        .properties(height=360))
-st.altair_chart(line, use_container_width=True)
+    if daily_melt.empty:
+        st.caption("Sem evolução diária para exibir.")
+    else:
+        line = (alt.Chart(daily_melt)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("__DATA__:T", title="Data"),
+                    y=alt.Y("Valor:Q", title="Quantidade"),
+                    color=alt.Color("Métrica:N", title="Métrica"),
+                    tooltip=[alt.Tooltip("__DATA__:T", title="Data"),
+                             alt.Tooltip("Métrica:N", title="Métrica"),
+                             alt.Tooltip("Valor:Q", title="Valor")]
+                )
+                .properties(height=360))
+        st.altair_chart(line, use_container_width=True)
 
 # =========================
-# Produção por Unidade (Líquido) — BARRAS VERTICAIS
+# Produção por Unidade (Líquido)
 # =========================
 st.markdown("<div class='section-title'>🏙️ Produção por Unidade (Líquido)</div>", unsafe_allow_html=True)
 
-by_unid = (view.groupby(col_unid, dropna=False)
-                .agg(liq=("IS_REV", lambda s: s.size - s.sum()))
-                .reset_index()
-                .sort_values("liq", ascending=False))
+if view.empty:
+    st.caption("Sem dados de unidades para o período.")
+else:
+    by_unid = (view.groupby(col_unid, dropna=False)
+                    .agg(liq=("IS_REV", lambda s: s.size - s.sum()))
+                    .reset_index()
+                    .sort_values("liq", ascending=False))
 
-bar_unid = (alt.Chart(by_unid)
-            .mark_bar()
-            .encode(
-                x=alt.X(f"{col_unid}:N", sort='-y', title="Unidade",
-                        axis=alt.Axis(labelAngle=-30)),
-                y=alt.Y("liq:Q", title="Líquido"),
-                tooltip=[alt.Tooltip(f"{col_unid}:N", title="Unidade"),
-                         alt.Tooltip("liq:Q", title="Líquido")]
-            )
-            .properties(height=420))
-st.altair_chart(bar_unid, use_container_width=True)
+    if by_unid.empty:
+        st.caption("Sem produção por unidade dentro dos filtros.")
+    else:
+        bar_unid = (alt.Chart(by_unid)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X(f"{col_unid}:N", sort='-y', title="Unidade",
+                                axis=alt.Axis(labelAngle=-30)),
+                        y=alt.Y("liq:Q", title="Líquido"),
+                        tooltip=[alt.Tooltip(f"{col_unid}:N", title="Unidade"),
+                                 alt.Tooltip("liq:Q", title="Líquido")]
+                    )
+                    .properties(height=420))
+        st.altair_chart(bar_unid, use_container_width=True)
 
 # =========================
 # Auditoria – Chassis com múltiplas vistorias
 # =========================
 st.markdown("<div class='section-title'>🕵️ Chassis com múltiplas vistorias</div>", unsafe_allow_html=True)
 
-dup = (view.groupby(col_chassi, dropna=False)
-            .agg(QTD=("VISTORIADOR","size"),
-                 PRIMEIRA_DATA=("__DATA__", "min"),
-                 ULTIMA_DATA=("__DATA__", "max"))
-            .reset_index())
-dup = dup[dup["QTD"] >= 2].sort_values("QTD", ascending=False)
-
-if len(dup) == 0:
+if view.empty:
     st.caption("Nenhum chassi com múltiplas vistorias dentro dos filtros.")
 else:
-    first_map = (view.sort_values(["__DATA__"])
-                     .drop_duplicates(subset=[col_chassi], keep="first")
-                     .set_index(col_chassi)["VISTORIADOR"]
-                     .to_dict())
-    last_map = (view.sort_values(["__DATA__"])
-                    .drop_duplicates(subset=[col_chassi], keep="last")
-                    .set_index(col_chassi)["VISTORIADOR"]
-                    .to_dict())
-    dup["PRIMEIRO_VIST"] = dup[col_chassi].map(first_map)
-    dup["ULTIMO_VIST"]   = dup[col_chassi].map(last_map)
+    dup = (view.groupby(col_chassi, dropna=False)
+                .agg(QTD=("VISTORIADOR","size"),
+                     PRIMEIRA_DATA=("__DATA__", "min"),
+                     ULTIMA_DATA=("__DATA__", "max"))
+                .reset_index())
+    dup = dup[dup["QTD"] >= 2].sort_values("QTD", ascending=False)
 
-    st.dataframe(dup, use_container_width=True, hide_index=True)
+    if len(dup) == 0:
+        st.caption("Nenhum chassi com múltiplas vistorias dentro dos filtros.")
+    else:
+        first_map = (view.sort_values(["__DATA__"])
+                        .drop_duplicates(subset=[col_chassi], keep="first")
+                        .set_index(col_chassi)["VISTORIADOR"]
+                        .to_dict())
+        last_map = (view.sort_values(["__DATA__"])
+                        .drop_duplicates(subset=[col_chassi], keep="last")
+                        .set_index(col_chassi)["VISTORIADOR"]
+                        .to_dict())
+        dup["PRIMEIRO_VIST"] = dup[col_chassi].map(first_map)
+        dup["ULTIMO_VIST"]   = dup[col_chassi].map(last_map)
+
+        st.dataframe(dup, use_container_width=True, hide_index=True)
 
 # =========================
 # 🧮 CONSOLIDADO DO MÊS + RANKING MENSAL (TOP/BOTTOM)
@@ -575,7 +591,6 @@ else:
         "</div>", unsafe_allow_html=True
     )
 
-    # helpers p/ ranking
     def chip_pct_row(p):
         if pd.isna(p): return "—"
         p = float(p)
@@ -641,10 +656,8 @@ else:
     render_ranking(base_mes[base_mes["TIPO"].isin(["MÓVEL", "MOVEL"])], "vistoriadores MÓVEL")
 
 # =========================
-# 📅 RANKING DO DIA POR VISTORIADOR (TOP/BOTTOM) – sem data no título
+# 📅 RANKING DO DIA POR VISTORIADOR (TOP/BOTTOM)
 # =========================
-
-# helper anti-tradução (se ainda não existir)
 if '_nt' not in globals():
     st.markdown("<style>.notranslate{}</style>", unsafe_allow_html=True)
     def _nt(txt: str) -> str:
@@ -656,12 +669,10 @@ BOTTOM_LABEL = "BOTTOM BOX"
 st.markdown("---")
 st.markdown("<div class='section-title'>📅 Ranking do Dia por Vistoriador</div>", unsafe_allow_html=True)
 
-# datas disponíveis no 'view' já filtrado
 dates_avail = sorted([d for d in view["__DATA__"] if isinstance(d, date)])
 if not dates_avail:
     st.info("Sem datas dentro dos filtros atuais para montar o ranking diário.")
 else:
-    # seletor com estado persistente
     default_day = dates_avail[-1]
     rank_day = st.date_input(
         "Dia para o ranking",
@@ -670,7 +681,6 @@ else:
         key="rank_day_sel",
     )
 
-    # usa o dia escolhido; se não houver dados, pega o último ≤ escolhido
     if rank_day in dates_avail:
         used_day = rank_day
         info_msg = None
@@ -686,20 +696,18 @@ else:
 
     view_dia = view[view["__DATA__"] == used_day].copy()
 
-    # produção do dia por vistoriador
     prod_dia = (view_dia.groupby("VISTORIADOR", dropna=False)
                 .agg(VISTORIAS_DIA=("IS_REV", "size"),
                      REVISTORIAS_DIA=("IS_REV", "sum"))
                 .reset_index())
     prod_dia["LIQUIDO_DIA"] = prod_dia["VISTORIAS_DIA"] - prod_dia["REVISTORIAS_DIA"]
 
-    # metas (para META_DIA) vindas da aba METAS
     if (df_metas is not None) and len(df_metas):
         metas_join = df_metas[["VISTORIADOR", "TIPO", "META_MENSAL", "DIAS_UTEIS"]].copy()
     else:
         metas_join = pd.DataFrame(columns=["VISTORIADOR", "TIPO", "META_MENSAL", "DIAS_UTEIS"])
 
-    base_dia = prod_dia.merge(metas_join, on("VISTORIADOR"), how="left")
+    base_dia = prod_dia.merge(metas_join, on="VISTORIADOR", how="left")
     base_dia["TIPO"] = base_dia["TIPO"].astype(str).str.upper().replace({"MOVEL": "MÓVEL"}).replace("", "—")
     for c in ["META_MENSAL", "DIAS_UTEIS"]:
         base_dia[c] = pd.to_numeric(base_dia.get(c, 0), errors="coerce").fillna(0)
@@ -733,7 +741,6 @@ else:
 
         rk = rk.sort_values("ATING_DIA_%", ascending=False)
 
-        # TOP 5
         top = rk.head(5).copy()
         medals = ["🥇", "🥈", "🥉", "🏅", "🏅"]
         top["🏅"] = [medals[i] if i < len(medals) else "🏅" for i in range(len(top))]
@@ -747,7 +754,6 @@ else:
             "% Ating. (dia)": top["ATING_DIA_%"].map(chip_pct_row_dia),
         })
 
-        # BOTTOM 5
         bot = rk.tail(5).sort_values("ATING_DIA_%", ascending=True).copy()
         badgies = ["🆘", "🪫", "🐢", "⚠️", "⚠️"]
         bot["⚠️"] = [badgies[i] if i < len(badgies) else "⚠️" for i in range(len(bot))]
