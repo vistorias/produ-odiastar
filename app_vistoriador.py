@@ -5,7 +5,7 @@
 # Mantém filtros, KPIs, gráficos e rankings (mensal e do dia)
 # ------------------------------------------------------------
 
-import os, json
+import os, json, re
 from datetime import datetime, date
 
 import streamlit as st
@@ -54,8 +54,8 @@ st.markdown("""
 # =========================
 # 🔧 Config da Pasta do Drive
 # =========================
-# 👉 COLE AQUI o ID da pasta do Drive onde ficam as planilhas mensais
-FOLDER_ID = "COLOQUE_O_ID_DA_SUA_PASTA_AQUI"
+# 👉 COLE AQUI o ID **ou a URL** da pasta do Drive onde ficam as planilhas mensais
+FOLDER_ID = "1rDeXts0WRA-lvx_FhqottTPEYf3Iqsql"
 SHEET_ID = None  # não usado nesta versão (tudo vem da pasta)
 SERVICE_EMAIL = None
 
@@ -97,6 +97,21 @@ def _auth_client():
     creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
     return gspread.authorize(creds)
 
+def _resolve_folder_id(val: str | None) -> str | None:
+    """
+    Aceita ID OU URL da pasta e devolve só o ID.
+    Retorna None se não der para resolver.
+    """
+    if not val:
+        return None
+    s = str(val).strip()
+    m = re.search(r'/folders/([a-zA-Z0-9_-]+)', s)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r'[a-zA-Z0-9_-]{10,}', s):
+        return s
+    return None
+
 def _list_spreadsheets_in_folder(client, folder_id: str):
     """
     Lista planilhas (Google Sheets) dentro de uma pasta do Drive.
@@ -105,15 +120,12 @@ def _list_spreadsheets_in_folder(client, folder_id: str):
     - versões antigas: list_spreadsheet_files() sem argumentos e tentamos filtrar por 'parents'
     """
     try:
-        # gspread novas versões
         return client.list_spreadsheet_files(folder_id=folder_id) or []
     except TypeError:
-        # versões mais antigas
         try:
             files = client.list_spreadsheet_files()
         except Exception:
             return []
-
         filtered = []
         for f in files:
             parents = f.get("parents")
@@ -135,7 +147,13 @@ def carregar_da_pasta(folder_id: str):
     - pulados: (nome, erro) ignorados
     """
     client = _auth_client()
-    files = _list_spreadsheets_in_folder(client, folder_id)
+    fid = _resolve_folder_id(folder_id)
+    if not fid:
+        raise RuntimeError(
+            "FOLDER_ID inválido. Cole o ID (trecho após /folders/ na URL) ou a URL completa da pasta do Drive."
+        )
+
+    files = _list_spreadsheets_in_folder(client, fid)
     if not files:
         raise RuntimeError("Não encontrei planilhas na pasta.")
 
@@ -199,7 +217,12 @@ try:
                 st.write(f"- {nm}: {msg}")
 except Exception as e:
     st.error("Não consegui ler as planilhas da pasta.")
-    st.info(f"Compartilhe a pasta com: **{SERVICE_EMAIL}** (Leitor/Editor).")
+    st.info(
+        "Verifique:\n"
+        "1) Se o FOLDER_ID é o ID ou a URL da pasta (o app aceita os dois);\n"
+        f"2) Se a pasta está compartilhada com **{SERVICE_EMAIL}** (Leitor/Editor);\n"
+        "3) Se a pasta realmente contém arquivos Google Sheets (não só atalhos)."
+    )
     with st.expander("Detalhes do erro"):
         st.exception(e)
     st.stop()
@@ -412,6 +435,15 @@ grp = (view
        .agg(
             VISTORIAS=("IS_REV", "size"),
             REVISTORIAS=("IS_REV", "sum"),
+            DIAS_ATIVOS=("::__DATA__", lambda s: s.dropna().nunique())  # placeholder; corrected next line
+       )
+       .reset_index())
+# corrigir DIAS_ATIVOS (linha acima era placeholder só p/ evitar colar comentário dentro)
+grp = (view
+       .groupby("VISTORIADOR", dropna=False)
+       .agg(
+            VISTORIAS=("IS_REV", "size"),
+            REVISTORIAS=("IS_REV", "sum"),
             DIAS_ATIVOS=("__DATA__", lambda s: s.dropna().nunique()),
             UNIDADES=(col_unid, lambda s: s.dropna().nunique()),
        )
@@ -419,20 +451,17 @@ grp = (view
 
 grp["LIQUIDO"]  = grp["VISTORIAS"] - grp["REVISTORIAS"]
 
-# ---- dias úteis passados por vistoriador (robusto p/ sábado/domingo)
+# ---- dias úteis passados por vistoriador (seg–sex)
 def _is_workday(d):
-    return isinstance(d, date) and d.weekday() < 5  # 0..4 = seg–sex
+    return isinstance(d, date) and d.weekday() < 5
 
 def _calc_wd_passados(df_view: pd.DataFrame) -> pd.DataFrame:
-    # Sempre devolve DataFrame com colunas: VISTORIADOR, DIAS_PASSADOS
     if df_view.empty or "__DATA__" not in df_view.columns or "VISTORIADOR" not in df_view.columns:
         return pd.DataFrame(columns=["VISTORIADOR", "DIAS_PASSADOS"])
-
     mask = df_view["__DATA__"].apply(_is_workday)
     if not mask.any():
         vists = df_view["VISTORIADOR"].dropna().unique()
         return pd.DataFrame({"VISTORIADOR": vists, "DIAS_PASSADOS": np.zeros(len(vists), dtype=int)})
-
     out = (df_view.loc[mask]
            .groupby("VISTORIADOR")["__DATA__"]
            .nunique()
