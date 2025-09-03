@@ -56,9 +56,7 @@ st.markdown("""
 # =========================
 # 👉 COLE AQUI o ID da pasta do Drive onde ficam as planilhas mensais
 FOLDER_ID = "COLOQUE_O_ID_DA_SUA_PASTA_AQUI"
-# Deixe SHEET_ID = None para usar a pasta (não usado nesta versão)
-SHEET_ID = None
-
+SHEET_ID = None  # não usado nesta versão (tudo vem da pasta)
 SERVICE_EMAIL = None
 
 # =========================
@@ -100,9 +98,28 @@ def _auth_client():
     return gspread.authorize(creds)
 
 def _list_spreadsheets_in_folder(client, folder_id: str):
-    # lista só Google Sheets na pasta
-    q = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-    return client.list_spreadsheet_files(query=q) or []
+    """
+    Lista planilhas (Google Sheets) dentro de uma pasta do Drive.
+    Compatível com diferentes versões do gspread:
+    - versões novas: aceita folder_id=
+    - versões antigas: list_spreadsheet_files() sem argumentos e tentamos filtrar por 'parents'
+    """
+    try:
+        # gspread novas versões
+        return client.list_spreadsheet_files(folder_id=folder_id) or []
+    except TypeError:
+        # versões mais antigas
+        try:
+            files = client.list_spreadsheet_files()
+        except Exception:
+            return []
+
+        filtered = []
+        for f in files:
+            parents = f.get("parents")
+            if parents and folder_id in parents:
+                filtered.append(f)
+        return filtered if filtered else files
 
 # =========================
 # Carregar TODAS as planilhas da pasta e concatenar
@@ -113,21 +130,29 @@ def carregar_da_pasta(folder_id: str):
     Retorna:
     - df_all: DataFrame concatenado de todas as planilhas (sheet1) da pasta
     - df_metas: DataFrame da aba METAS do arquivo mais recente (ou None)
-    - info_files: lista de dicts com 'name', 'id', 'modifiedTime' dos arquivos lidos
+    - files_sorted: lista de arquivos ordenada por modifiedTime/createdTime desc
+    - lidos: nomes lidos
+    - pulados: (nome, erro) ignorados
     """
     client = _auth_client()
     files = _list_spreadsheets_in_folder(client, folder_id)
     if not files:
         raise RuntimeError("Não encontrei planilhas na pasta.")
 
-    # Ordena por data de modificação (descendente)
-    files_sorted = sorted(files, key=lambda f: f.get("modifiedTime", ""), reverse=True)
+    # Ordena por modifiedTime/createdTime (desc), com fallback
+    def _sort_key(f):
+        for k in ("modifiedTime", "createdTime"):
+            ts = f.get(k)
+            if ts:
+                v = pd.to_datetime(ts, errors="coerce")
+                if pd.notna(v):
+                    return v
+        return pd.Timestamp.min
+
+    files_sorted = sorted(files, key=_sort_key, reverse=True)
 
     # Concatena dados de todas (sheet1)
-    lot = []
-    lidos = []
-    pulados = []
-
+    lot, lidos, pulados = [], [], []
     for f in files_sorted:
         try:
             sh = client.open_by_key(f["id"])
@@ -145,7 +170,7 @@ def carregar_da_pasta(folder_id: str):
 
     df_all = pd.concat(lot, ignore_index=True, sort=False) if lot else pd.DataFrame()
 
-    # Tenta ler a METAS do arquivo mais recente que possua essa worksheet
+    # Tenta ler a METAS do arquivo mais recente que tenha a worksheet
     df_metas = None
     for f in files_sorted:
         try:
@@ -165,7 +190,6 @@ def carregar_da_pasta(folder_id: str):
 st.markdown("#### Conexão com a Base — Planilhas na Pasta do Drive")
 try:
     df_raw, df_metas_raw, files_sorted, lidos, pulados = carregar_da_pasta(FOLDER_ID)
-    nomes = [f["name"] for f in files_sorted]
     if lidos:
         shown = ", ".join(lidos[:5]) + (" …" if len(lidos) > 5 else "")
         st.success(f"✅ {len(lidos)} planilhas lidas da pasta. Exemplos: {shown}")
@@ -225,7 +249,6 @@ def parse_date_any(x):
 df = df_raw.copy()
 if df.empty:
     st.info("A pasta foi lida, mas não há linhas de dados nas planilhas (sheet1).")
-# padroniza cabeçalhos
 df.columns = [c.strip().upper() for c in df.columns]
 
 col_unid  = "UNIDADE"   if "UNIDADE"   in df.columns else None
@@ -239,7 +262,6 @@ if any(c is None for c in required):
     st.error("As planilhas precisam conter as colunas: UNIDADE, DATA, CHASSI, PERITO/DIGITADOR.")
     st.stop()
 
-# Normalizar
 df[col_unid]   = df[col_unid].map(_upper_strip)
 df[col_chassi] = df[col_chassi].map(_upper_strip)
 df["__DATA__"] = df[col_data].apply(parse_date_any)
@@ -314,9 +336,8 @@ datas_validas = [d for d in df["__DATA__"] if isinstance(d, date)]
 dmin = min(datas_validas) if datas_validas else date.today()
 dmax = max(datas_validas) if datas_validas else date.today()
 
-# Defaults de datas na Session State
+# Defaults de datas (começo do mês atual até o máx. disponível)
 if "dt_ini" not in st.session_state:
-    # por padrão, começo do mês atual
     today = date.today()
     st.session_state["dt_ini"] = date(today.year, today.month, 1)
 if "dt_fim" not in st.session_state:
@@ -341,11 +362,10 @@ with colV2:
     b3.button("Selecionar todos", use_container_width=True, on_click=cb_sel_all_vists)
     b4.button("Limpar", use_container_width=True, on_click=cb_clear_vists)
 
-# Botão para renovar o cache (recarregar pasta)
 st.caption(" ")
 if st.button("🔄 Atualizar dados da pasta (recarregar)"):
     carregar_da_pasta.clear()  # limpa cache
-    st.experimental_rerun()
+    st.rerun()
 
 # =========================
 # Aplicar filtros aos dados
@@ -378,7 +398,7 @@ cards = [
 
 st.markdown(
     '<div class="card-container">' +
-    "".join([f"<div class='card'><h4>{t}</h4><h2>{v}</h2></div>" for t, v in cards]) +
+    "".join([f"<div class=\'card\'><h4>{t}</h4><h2>{v}</h2></div>" for t, v in cards]) +
     "</div>", unsafe_allow_html=True
 )
 
