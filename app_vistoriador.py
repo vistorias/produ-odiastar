@@ -187,12 +187,12 @@ elif col_perito:
 else:
     df["VISTORIADOR"] = df[col_digit].map(_upper_strip)
 
-# Revistoria
+# Revistoria (ordem por data + chassi)
 df = df.sort_values(["__DATA__", col_chassi], kind="mergesort").reset_index(drop=True)
 df["__ORD__"] = df.groupby(col_chassi).cumcount()
 df["IS_REV"] = (df["__ORD__"] >= 1).astype(int)
 
-# Remover "POSTO CÓDIGO/CODIGO" e valores vazios
+# Remover "POSTO CÓDIGO/CODIGO" e valores vazios de unidade
 BAN_UNIDS = {"POSTO CÓDIGO", "POSTO CODIGO", "CÓDIGO", "CODIGO", "", "—", "NAN"}
 df = df[~df[col_unid].isin(BAN_UNIDS)].copy()
 
@@ -234,8 +234,7 @@ with colU1:
         "Unidades",
         options=unidades_opts,
         key="unids_tmp",
-        help="Selecione as unidades desejadas",
-        on_change=st.rerun,
+        help="Selecione as unidades desejadas"
     )
 with colU2:
     b1, b2 = st.columns(2)
@@ -263,8 +262,7 @@ with colV1:
         "Vistoriadores",
         options=vist_opts,
         key="vists_tmp",
-        help="Filtra pela(s) pessoa(s).",
-        on_change=st.rerun,
+        help="Filtra pela(s) pessoa(s)."
     )
 with colV2:
     b3, b4 = st.columns(2)
@@ -282,6 +280,8 @@ if st.session_state.dt_ini and st.session_state.dt_fim:
 if st.session_state.vists_tmp:
     view = view[view["VISTORIADOR"].isin(st.session_state.vists_tmp)]
 
+if view.empty:
+    st.info("Nenhum registro para os filtros aplicados.")
 # =========================
 # KPIs (cartões)
 # =========================
@@ -320,21 +320,27 @@ grp = (view
 
 grp["LIQUIDO"]  = grp["VISTORIAS"] - grp["REVISTORIAS"]
 
-# ---- dias úteis passados por vistoriador (robusto p/ dataset vazio)
+# ---- dias úteis passados por vistoriador (robusto p/ sábado/domingo)
 def _is_workday(d):
-    return isinstance(d, date) and d.weekday() < 5
+    return isinstance(d, date) and d.weekday() < 5  # 0..4 = seg–sex
 
-def _calc_wd_passados(df_view: pd.DataFrame) -> pd.Series:
+def _calc_wd_passados(df_view: pd.DataFrame) -> pd.DataFrame:
+    # Sempre devolve DataFrame com colunas: VISTORIADOR, DIAS_PASSADOS
     if df_view.empty or "__DATA__" not in df_view.columns or "VISTORIADOR" not in df_view.columns:
-        return pd.Series(dtype=int, name="DIAS_PASSADOS")
+        return pd.DataFrame(columns=["VISTORIADOR", "DIAS_PASSADOS"])
+
     mask = df_view["__DATA__"].apply(_is_workday)
     if not mask.any():
-        return pd.Series(dtype=int, name="DIAS_PASSADOS")
-    return (df_view.loc[mask]
-            .groupby("VISTORIADOR")["__DATA__"]
-            .nunique()
-            .astype(int)
-            .rename("DIAS_PASSADOS"))
+        vists = df_view["VISTORIADOR"].dropna().unique()
+        return pd.DataFrame({"VISTORIADOR": vists, "DIAS_PASSADOS": np.zeros(len(vists), dtype=int)})
+
+    out = (df_view.loc[mask]
+           .groupby("VISTORIADOR")["__DATA__"]
+           .nunique()
+           .reset_index()
+           .rename(columns={"__DATA__": "DIAS_PASSADOS"}))
+    out["DIAS_PASSADOS"] = out["DIAS_PASSADOS"].astype(int)
+    return out
 
 wd_passados = _calc_wd_passados(view)
 grp = grp.merge(wd_passados, on="VISTORIADOR", how="left")
