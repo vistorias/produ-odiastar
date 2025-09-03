@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 # ------------------------------------------------------------
 # Painel de Produção por Vistoriador (Streamlit) - versão visual (emojis)
-# Lê TODAS as planilhas de uma pasta do Drive (sheet1) e concatena
-# Mantém filtros, KPIs, gráficos e rankings (mensal e do dia)
+# - Filtros reativos
+# - Cartões: Vistorias (geral), Vistorias líquidas, Revistorias, % Revistorias
+# - Remove "POSTO CÓDIGO" e unidades vazias
+# - Ranking mensal (TOP BOX / BOTTOM BOX) por FIXO e MÓVEL
+# - Ranking do dia (TOP/BOTTOM) por FIXO e MÓVEL
 # ------------------------------------------------------------
 
-import os, json, re
+import os, json
 from datetime import datetime, date
 
 import streamlit as st
@@ -52,16 +55,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================
-# 🔧 Config da Pasta do Drive
+# Conexão Google Sheets
 # =========================
-# 👉 COLE AQUI o ID **ou a URL** da pasta do Drive onde ficam as planilhas mensais
-FOLDER_ID = "https://drive.google.com/drive/u/0/folders/1rDeXts0WRA-lvx_FhqottTPEYf3Iqsql"
-SHEET_ID = None  # não usado nesta versão (tudo vem da pasta)
+SHEET_ID = "14Bm5H9C20LqABklE3FniGjKM4-angZQ2fPRV7Uqm0GI"
 SERVICE_EMAIL = None
 
-# =========================
-# Autenticação & helpers
-# =========================
 def _load_sa_info():
     try:
         block = st.secrets["gcp_service_account"]
@@ -86,7 +84,7 @@ def _load_sa_info():
             st.stop()
     return dict(block), "dict"
 
-def _auth_client():
+def conectar_gsheets(sheet_id: str):
     global SERVICE_EMAIL
     info, _ = _load_sa_info()
     SERVICE_EMAIL = info.get("client_email", "(sem client_email)")
@@ -94,150 +92,40 @@ def _auth_client():
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
-    return gspread.authorize(creds)
-
-def _resolve_folder_id(val: str | None) -> str | None:
-    """
-    Aceita ID OU URL da pasta e devolve só o ID.
-    Retorna None se não der para resolver.
-    """
-    if not val:
-        return None
-    s = str(val).strip()
-    m = re.search(r'/folders/([a-zA-Z0-9_-]+)', s)
-    if m:
-        return m.group(1)
-    if re.fullmatch(r'[a-zA-Z0-9_-]{10,}', s):
-        return s
-    return None
-
-def _list_spreadsheets_in_folder(client, folder_id: str):
-    """
-    Lista planilhas (Google Sheets) dentro de uma pasta do Drive.
-    Compatível com diferentes versões do gspread:
-    - versões novas: aceita folder_id=
-    - versões antigas: list_spreadsheet_files() sem argumentos e tentamos filtrar por 'parents'
-    """
     try:
-        return client.list_spreadsheet_files(folder_id=folder_id) or []
-    except TypeError:
-        try:
-            files = client.list_spreadsheet_files()
-        except Exception:
-            return []
-        filtered = []
-        for f in files:
-            parents = f.get("parents")
-            if parents and folder_id in parents:
-                filtered.append(f)
-        return filtered if filtered else files
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
+        client = gspread.authorize(creds)
+        sh = client.open_by_key(sheet_id)
+        ws = sh.sheet1
+        data = ws.get_all_records()
+        df = pd.DataFrame(data)
+        return ws, df
+    except Exception as e:
+        st.error("Não consegui ler a planilha.")
+        st.info(f"Compartilhe com: **{SERVICE_EMAIL}** (Leitor/Editor).")
+        with st.expander("Erro ao abrir a planilha"):
+            st.exception(e)
+        st.stop()
 
-# =========================
-# Carregar TODAS as planilhas da pasta e concatenar
-# =========================
-@st.cache_data(ttl=600, show_spinner=False)
-def carregar_da_pasta(folder_id: str):
-    """
-    Retorna:
-    - df_all: DataFrame concatenado de todas as planilhas (sheet1) da pasta
-    - df_metas: DataFrame da aba METAS do arquivo mais recente (ou None)
-    - files_sorted: lista de arquivos ordenada por modifiedTime/createdTime desc
-    - lidos: nomes lidos
-    - pulados: (nome, erro) ignorados
-    """
-    client = _auth_client()
-    fid = _resolve_folder_id(folder_id)
-    if not fid:
-        raise RuntimeError(
-            "FOLDER_ID inválido. Cole o ID (trecho após /folders/ na URL) ou a URL completa da pasta do Drive."
-        )
-
-    files = _list_spreadsheets_in_folder(client, fid)
-    if not files:
-        raise RuntimeError("Não encontrei planilhas na pasta.")
-
-    # Ordena por modifiedTime/createdTime (desc), com fallback
-    def _sort_key(f):
-        for k in ("modifiedTime", "createdTime"):
-            ts = f.get(k)
-            if ts:
-                v = pd.to_datetime(ts, errors="coerce")
-                if pd.notna(v):
-                    return v
-        return pd.Timestamp.min
-
-    files_sorted = sorted(files, key=_sort_key, reverse=True)
-
-    # Concatena dados de todas (sheet1)
-    lot, lidos, pulados = [], [], []
-    for f in files_sorted:
-        try:
-            sh = client.open_by_key(f["id"])
-            ws = sh.sheet1
-            data = ws.get_all_records()
-            if not data:
-                continue
-            df_part = pd.DataFrame(data)
-            df_part["__ARQUIVO__"] = f.get("name", "")
-            df_part["__FILE_ID__"] = f.get("id", "")
-            lot.append(df_part)
-            lidos.append(f.get("name", ""))
-        except Exception as e:
-            pulados.append((f.get("name",""), str(e)))
-
-    df_all = pd.concat(lot, ignore_index=True, sort=False) if lot else pd.DataFrame()
-
-    # Tenta ler a METAS do arquivo mais recente que tenha a worksheet
-    df_metas = None
-    for f in files_sorted:
-        try:
-            sh = client.open_by_key(f["id"])
-            metas_ws = sh.worksheet("METAS")
-            metas_data = metas_ws.get_all_records()
-            df_metas = pd.DataFrame(metas_data) if metas_data else pd.DataFrame()
-            break
-        except Exception:
-            continue
-
-    return df_all, df_metas, files_sorted, lidos, pulados
-
-# =========================
-# Conexão / leitura
-# =========================
-st.markdown("#### Conexão com a Base — Planilhas na Pasta do Drive")
-try:
-    df_raw, df_metas_raw, files_sorted, lidos, pulados = carregar_da_pasta(FOLDER_ID)
-    if lidos:
-        shown = ", ".join(lidos[:5]) + (" …" if len(lidos) > 5 else "")
-        st.success(f"✅ {len(lidos)} planilhas lidas da pasta. Exemplos: {shown}")
-    if pulados:
-        with st.expander("⚠️ Arquivos ignorados (erro na leitura)"):
-            for nm, msg in pulados:
-                st.write(f"- {nm}: {msg}")
-except Exception as e:
-    st.error("Não consegui ler as planilhas da pasta.")
-    st.info(
-        "Verifique:\n"
-        "1) Se o FOLDER_ID é o ID ou a URL da pasta (o app aceita os dois);\n"
-        f"2) Se a pasta está compartilhada com **{SERVICE_EMAIL}** (Leitor/Editor);\n"
-        "3) Se a pasta realmente contém arquivos Google Sheets (não só atalhos)."
-    )
-    with st.expander("Detalhes do erro"):
-        st.exception(e)
-    st.stop()
+st.markdown("#### Conexão com a Base — Planilha de Produção por Vistoriador")
+ws, df_raw = conectar_gsheets(SHEET_ID)
+st.success("✅ Conectado à planilha com sucesso.")
 
 # ==== helpers reutilizados ====
 def _upper_strip(x):
     return str(x).upper().strip() if pd.notna(x) else ""
 
-# --- Lê/normaliza METAS (se veio de alguma planilha)
-def normalizar_metas(df_metas_raw: pd.DataFrame | None) -> pd.DataFrame | None:
-    if df_metas_raw is None:
+# --- Lê a aba METAS (opcional) ---
+def ler_aba_metas(worksheet_handle) -> pd.DataFrame | None:
+    try:
+        metas_ws = worksheet_handle.spreadsheet.worksheet("METAS")
+    except Exception:
         return None
-    metas = df_metas_raw.copy()
+
+    metas = pd.DataFrame(metas_ws.get_all_records())
     if metas.empty:
         return metas
+
     metas.columns = [c.strip().upper() for c in metas.columns]
     ren = {}
     for cand in ["META_MENSAL", "META MEN SAL", "META_MEN SAL", "META_MEN.SAL", "META MENSA"]:
@@ -255,7 +143,7 @@ def normalizar_metas(df_metas_raw: pd.DataFrame | None) -> pd.DataFrame | None:
     metas["DIAS_UTEIS"]  = pd.to_numeric(metas.get("DIAS_UTEIS", 0),  errors="coerce").fillna(0).astype(int)
     return metas
 
-df_metas = normalizar_metas(df_metas_raw)
+df_metas = ler_aba_metas(ws)
 
 # =========================
 # Limpeza e padronização
@@ -270,8 +158,6 @@ def parse_date_any(x):
     except: return pd.NaT
 
 df = df_raw.copy()
-if df.empty:
-    st.info("A pasta foi lida, mas não há linhas de dados nas planilhas (sheet1).")
 df.columns = [c.strip().upper() for c in df.columns]
 
 col_unid  = "UNIDADE"   if "UNIDADE"   in df.columns else None
@@ -282,7 +168,7 @@ col_digit = "DIGITADOR" if "DIGITADOR" in df.columns else None
 
 required = [col_unid, col_data, col_chassi, (col_perito or col_digit)]
 if any(c is None for c in required):
-    st.error("As planilhas precisam conter as colunas: UNIDADE, DATA, CHASSI, PERITO/DIGITADOR.")
+    st.error("A planilha precisa conter as colunas: UNIDADE, DATA, CHASSI, PERITO/DIGITADOR.")
     st.stop()
 
 df[col_unid]   = df[col_unid].map(_upper_strip)
@@ -306,7 +192,7 @@ df = df.sort_values(["__DATA__", col_chassi], kind="mergesort").reset_index(drop
 df["__ORD__"] = df.groupby(col_chassi).cumcount()
 df["IS_REV"] = (df["__ORD__"] >= 1).astype(int)
 
-# Remover "POSTO CÓDIGO/CODIGO" e valores vazios
+# Remover "POSTO CÓDIGO/CODIGO" e valores vazios de unidade
 BAN_UNIDS = {"POSTO CÓDIGO", "POSTO CODIGO", "CÓDIGO", "CODIGO", "", "—", "NAN"}
 df = df[~df[col_unid].isin(BAN_UNIDS)].copy()
 
@@ -359,10 +245,8 @@ datas_validas = [d for d in df["__DATA__"] if isinstance(d, date)]
 dmin = min(datas_validas) if datas_validas else date.today()
 dmax = max(datas_validas) if datas_validas else date.today()
 
-# Defaults de datas (começo do mês atual até o máx. disponível)
 if "dt_ini" not in st.session_state:
-    today = date.today()
-    st.session_state["dt_ini"] = date(today.year, today.month, 1)
+    st.session_state["dt_ini"] = dmin
 if "dt_fim" not in st.session_state:
     st.session_state["dt_fim"] = dmax
 
@@ -385,11 +269,6 @@ with colV2:
     b3.button("Selecionar todos", use_container_width=True, on_click=cb_sel_all_vists)
     b4.button("Limpar", use_container_width=True, on_click=cb_clear_vists)
 
-st.caption(" ")
-if st.button("🔄 Atualizar dados da pasta (recarregar)"):
-    carregar_da_pasta.clear()  # limpa cache
-    st.rerun()
-
 # =========================
 # Aplicar filtros aos dados
 # =========================
@@ -403,7 +282,6 @@ if st.session_state.vists_tmp:
 
 if view.empty:
     st.info("Nenhum registro para os filtros aplicados.")
-
 # =========================
 # KPIs (cartões)
 # =========================
@@ -421,7 +299,7 @@ cards = [
 
 st.markdown(
     '<div class="card-container">' +
-    "".join([f"<div class=\'card\'><h4>{t}</h4><h2>{v}</h2></div>" for t, v in cards]) +
+    "".join([f"<div class='card'><h4>{t}</h4><h2>{v}</h2></div>" for t, v in cards]) +
     "</div>", unsafe_allow_html=True
 )
 
@@ -435,15 +313,6 @@ grp = (view
        .agg(
             VISTORIAS=("IS_REV", "size"),
             REVISTORIAS=("IS_REV", "sum"),
-            DIAS_ATIVOS=("::__DATA__", lambda s: s.dropna().nunique())  # placeholder; corrected next line
-       )
-       .reset_index())
-# corrigir DIAS_ATIVOS (linha acima era placeholder só p/ evitar colar comentário dentro)
-grp = (view
-       .groupby("VISTORIADOR", dropna=False)
-       .agg(
-            VISTORIAS=("IS_REV", "size"),
-            REVISTORIAS=("IS_REV", "sum"),
             DIAS_ATIVOS=("__DATA__", lambda s: s.dropna().nunique()),
             UNIDADES=(col_unid, lambda s: s.dropna().nunique()),
        )
@@ -451,17 +320,20 @@ grp = (view
 
 grp["LIQUIDO"]  = grp["VISTORIAS"] - grp["REVISTORIAS"]
 
-# ---- dias úteis passados por vistoriador (seg–sex)
+# ---- dias úteis passados por vistoriador (robusto p/ sábado/domingo)
 def _is_workday(d):
-    return isinstance(d, date) and d.weekday() < 5
+    return isinstance(d, date) and d.weekday() < 5  # 0..4 = seg–sex
 
 def _calc_wd_passados(df_view: pd.DataFrame) -> pd.DataFrame:
+    # Sempre devolve DataFrame com colunas: VISTORIADOR, DIAS_PASSADOS
     if df_view.empty or "__DATA__" not in df_view.columns or "VISTORIADOR" not in df_view.columns:
         return pd.DataFrame(columns=["VISTORIADOR", "DIAS_PASSADOS"])
+
     mask = df_view["__DATA__"].apply(_is_workday)
     if not mask.any():
         vists = df_view["VISTORIADOR"].dropna().unique()
         return pd.DataFrame({"VISTORIADOR": vists, "DIAS_PASSADOS": np.zeros(len(vists), dtype=int)})
+
     out = (df_view.loc[mask]
            .groupby("VISTORIADOR")["__DATA__"]
            .nunique()
