@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 # ------------------------------------------------------------
 # Painel de Produção por Vistoriador (Streamlit) - MULTI-MESES
-# - Cole 1+ URLs/IDs de planilhas (uma por linha)
-# - Junta dados de todos os meses
-# - Lê METAS por planilha e amarra ao mês correto
+# - Lê automaticamente os arquivos listados na planilha-índice
+#   (ÍNDICE_MESES → aba ARQUIVOS: colunas URL, MÊS, ATIVO)
+# - Também permite colar links manualmente (fallback)
+# - Junta dados de todos os meses e lê METAS por mês
 # - KPIs, Resumo, Gráficos, Auditoria, Rankings Mensal e do Dia
 # ------------------------------------------------------------
 
@@ -20,10 +21,15 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # =========================
-# Config & título
+# CONFIG BÁSICA
 # =========================
 st.set_page_config(page_title="🧰 Produção por Vistoriador - Starcheck (multi-meses)", layout="wide")
 st.title("🧰 Painel de Produção por Vistoriador - Starcheck")
+
+# === Planilha-Índice (ARQUIVOS) ===
+# Troque pelo ID da SUA planilha "ÍNDICE_MESES" (a do print):
+INDEX_SHEET_ID = "1x0ByDHL_UH55r-KIc_gvMcg9YxonTwhJ3NKmpipnQ3I"
+INDEX_TAB_NAME = "ARQUIVOS"
 
 # --- proteção contra auto-tradução do navegador ---
 st.markdown("""
@@ -106,7 +112,7 @@ def extract_sheet_id(s: str) -> Optional[str]:
         return s
     return None
 
-# ---- parser de data
+# ---- helpers diversos
 def parse_date_any(x):
     if pd.isna(x) or x == "": return pd.NaT
     s = str(x).strip()
@@ -123,7 +129,6 @@ def parse_date_any(x):
 def _upper_strip(x):
     return str(x).upper().strip() if pd.notna(x) else ""
 
-# ---- tenta deduzir AAAA-MM do arquivo
 def infer_year_month_from_sheet(sh_title: str, df_data: pd.DataFrame) -> Optional[str]:
     # 1) pelo título (ex.: "09/2025 - Planilha ...")
     m = re.search(r'(\d{2})/(\d{4})', sh_title or "")
@@ -142,7 +147,9 @@ def infer_year_month_from_sheet(sh_title: str, df_data: pd.DataFrame) -> Optiona
                 pass
     return None
 
-# ---- lê dados + METAS de UMA planilha e devolve com rótulo de mês
+# =========================
+# Lê UMA planilha de mês (dados + METAS) e devolve AAAA-MM
+# =========================
 def read_one_sheet(gs_client, sheet_id: str) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
     sh = gs_client.open_by_key(sheet_id)
     title = sh.title or sheet_id
@@ -203,7 +210,6 @@ def read_one_sheet(gs_client, sheet_id: str) -> Tuple[pd.DataFrame, pd.DataFrame
         for cand in ["DIAS UTEIS", "DIAS ÚTEIS", "DIAS_UTEIS"]:
             if cand in dfm.columns: ren[cand] = "DIAS_UTEIS"
         dfm = dfm.rename(columns=ren)
-        # mínimos
         if "VISTORIADOR" in dfm.columns:
             dfm["VISTORIADOR"] = dfm["VISTORIADOR"].map(_upper_strip)
         if "UNIDADE" in dfm.columns:
@@ -225,29 +231,89 @@ def read_one_sheet(gs_client, sheet_id: str) -> Tuple[pd.DataFrame, pd.DataFrame
     return data, dfm, title
 
 # =========================
+# Leitura da PLANILHA-ÍNDICE
+# =========================
+def _yes(v) -> bool:
+    return str(v).strip().upper() in {"S", "SIM", "TRUE", "T", "1", "Y", "YES"}
+
+def load_ids_from_index(gs_client):
+    """Lê a planilha-índice e retorna uma lista de sheet_ids ativos.
+       Aceita URL ou ID na coluna 'URL'. Opcionalmente filtra por MÊS."""
+    try:
+        sh = gs_client.open_by_key(INDEX_SHEET_ID)
+        ws = sh.worksheet(INDEX_TAB_NAME)
+        rows = ws.get_all_records()  # [{'URL':..., 'MÊS':..., 'ATIVO':...}, ...]
+        if not rows:
+            st.warning("A planilha-índice está vazia.")
+            return []
+
+        # normaliza cabeçalhos
+        norm = []
+        for r in rows:
+            d = {str(k).strip().upper(): r[k] for k in r}
+            norm.append(d)
+
+        # pega só ATIVO = S
+        ativos = [r for r in norm if _yes(r.get("ATIVO", "S"))]
+
+        # filtro opcional por MÊS (se existir)
+        meses = sorted({str(r.get("MÊS","")).strip() for r in ativos if str(r.get("MÊS","")).strip()})
+        if meses:
+            sel = st.multiselect("Meses no índice (opcional)", meses, default=meses)
+            if sel:
+                ativos = [r for r in ativos if str(r.get("MÊS","")).strip() in sel]
+
+        # extrai IDs
+        ids = []
+        for r in ativos:
+            sid = extract_sheet_id(str(r.get("URL","")))
+            if sid:
+                ids.append(sid)
+
+        if not ids:
+            st.warning("Nenhum arquivo ativo/selecionado no índice.")
+        else:
+            st.success(f"Índice carregado: {len(ids)} arquivo(s) selecionado(s).")
+        return ids
+    except Exception as e:
+        st.error("Não consegui ler a planilha-índice (ÍNDICE_MESES). Verifique compartilhamento e ID.")
+        with st.expander("Detalhes do erro (índice)"):
+            st.exception(e)
+        return []
+
+# =========================
 # Entrada – múltiplas planilhas
 # =========================
 st.markdown("### Conexão com a Base — Arquivos (meses)")
-st.info("Cole uma **URL ou ID por linha** (ex.: 08/2025 e 09/2025). O app vai juntar tudo.")
-urls = st.text_area("Planilhas (uma por linha):", height=90, value="", help="Cole URLs/IDs de várias planilhas do Google Sheets, uma por linha.")
 
-# botão de juntar
-bt = st.button("🧩 Juntar todos os arquivos")
-if not bt and not urls.strip():
-    st.stop()
+modo = st.radio(
+    "Como quer apontar os arquivos?",
+    ("Planilha-Índice (recomendado)", "Colar links manualmente"),
+    horizontal=True,
+)
 
-# cria cliente
 client = make_client()
 
-# carrega todas
-sheet_ids = [extract_sheet_id(s) for s in urls.splitlines() if s.strip()]
-sheet_ids = [sid for sid in sheet_ids if sid]
+sheet_ids: List[str] = []
+
+if modo == "Planilha-Índice (recomendado)":
+    st.caption("Usando ÍNDICE_MESES → aba ARQUIVOS (URL, MÊS, ATIVO).")
+    sheet_ids = load_ids_from_index(client)
+else:
+    st.info("Cole uma **URL ou ID por linha** (ex.: 08/2025 e 09/2025). O app vai juntar tudo.")
+    urls = st.text_area("Planilhas (uma por linha):", height=90, value="")
+    if urls.strip():
+        sheet_ids = [extract_sheet_id(s) for s in urls.splitlines() if s.strip()]
+        sheet_ids = [sid for sid in sheet_ids if sid]
+    else:
+        st.stop()
 
 if not sheet_ids:
-    st.error("Nenhum ID/URL válido informado.")
-    st.info(f"Compartilhe as planilhas com: **{SERVICE_EMAIL}** (Leitor/Editor).")
+    st.error("Nenhum arquivo selecionado/encontrado.")
+    st.info(f"Se necessário, compartilhe as planilhas com: **{SERVICE_EMAIL}** (Leitor/Editor).")
     st.stop()
 
+# carrega todas
 all_df = []
 all_metas = []
 loaded = []
@@ -280,8 +346,6 @@ df_metas_all = pd.concat(all_metas, ignore_index=True) if len(all_metas) else pd
 # =========================
 # Continuação (igual ao seu painel)
 # =========================
-# colunas base já padronizadas na leitura: __DATA__, VISTORIADOR, IS_REV
-# descobrir nomes originais para UNIDADE e CHASSI
 orig_cols = [c for c in df.columns]
 col_unid  = "UNIDADE" if "UNIDADE" in orig_cols else None
 col_chassi= "CHASSI"  if "CHASSI"  in orig_cols else None
@@ -396,7 +460,7 @@ grp = (view
 
 grp["LIQUIDO"] = grp["VISTORIAS"] - grp["REVISTORIAS"]
 
-# ---- dias úteis passados por vistoriador (considera somente dias úteis presentes no filtro)
+# ---- dias úteis passados por vistoriador
 def _is_workday(d):
     return isinstance(d, date) and d.weekday() < 5
 
@@ -415,7 +479,7 @@ wd_passados = _calc_wd_passados(view)
 grp = grp.merge(wd_passados, on="VISTORIADOR", how="left").fillna({"DIAS_PASSADOS":0})
 grp["DIAS_PASSADOS"] = grp["DIAS_PASSADOS"].astype(int)
 
-# ---- METAS: usar o mês de referência MAIS RECENTE dentro do filtro
+# ---- METAS: usar o mês ref mais recente dentro do filtro
 if not view.empty:
     ref = max([d for d in view["__DATA__"] if isinstance(d, date)])
     ref_ym = f"{ref.year}-{ref.month:02d}"
@@ -489,7 +553,6 @@ cols_show = [
     "VISTORIAS", "REVISTORIAS", "LIQUIDO",
     "FALTANTE_MES", "NECESSIDADE_DIA", "TENDÊNCIA", "PROJECAO_MES"
 ]
-# evita KeyError se alguma coluna não existir
 cols_show_avail = [c for c in cols_show if c in fmt.columns]
 
 if fmt.empty or not cols_show_avail:
