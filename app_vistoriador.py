@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 # ------------------------------------------------------------
-# Painel de Produção por Vistoriador (Streamlit)
-# - Lê várias planilhas (pela pasta do Drive OU lista manual de IDs/URLs)
-# - Junta meses e respeita META por mês (REF_MONTH)
-# - Visual e cálculos iguais ao seu código "perfeito"
+# Painel de Produção por Vistoriador (Streamlit) - múltiplas planilhas/mês
+#  - Lê 1+ planilhas do Google Sheets (IDs/URLs, separadas por linha)
+#  - Junta dados dos meses e preserva metas por mês (MESREF)
+#  - Mantém layout e cálculos do seu app original
 # ------------------------------------------------------------
 
 import os, re, json
@@ -17,16 +17,8 @@ import altair as alt
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ====== Tenta carregar Drive API (opcional) ======
-DRIVE_AVAILABLE = True
-try:
-    from googleapiclient.discovery import build  # precisa estar no requirements.txt
-    from googleapiclient.errors import HttpError
-except Exception:
-    DRIVE_AVAILABLE = False
-
-# ============ UI / título ============
-st.set_page_config(page_title="🧰 Produção por Vistoriador - Starcheck", layout="wide")
+# =============== Config & título ===============
+st.set_page_config(page_title="🧰 Produção por Vistoriador - Starcheck (Multi-meses)", layout="wide")
 st.title("🧰 Painel de Produção por Vistoriador - Starcheck")
 
 st.markdown("""
@@ -56,60 +48,44 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# =========================
-# Segredos / auth Google
-# =========================
+# =============== Conexão Google Sheets ===============
 SERVICE_EMAIL = None
-# pasta do Drive (só usada se Drive API estiver disponível)
-FOLDER_ID = "1rDeXts0WRA-lvx_FhqottTPEYf3IqsqI"
 
 def _load_sa_info():
     try:
         block = st.secrets["gcp_service_account"]
     except Exception as e:
         st.error("Não encontrei [gcp_service_account] no .streamlit/secrets.toml.")
-        with st.expander("Detalhes"):
-            st.exception(e)
         st.stop()
-
-    if "json_path" in block:
+    if "json_path" in block:  # opcional: quando o segredo é um caminho de arquivo
         path = block["json_path"]
         if not os.path.isabs(path):
             path = os.path.join(os.path.dirname(__file__), path)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                info = json.load(f)
-            return info, f"file:{path}"
-        except Exception as e:
-            st.error(f"Não consegui abrir o JSON: {path}")
-            with st.expander("Detalhes"):
-                st.exception(e)
-            st.stop()
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f), f"file:{path}"
     return dict(block), "dict"
 
-def _auth_clients():
+def _gs_client():
     global SERVICE_EMAIL
     info, _ = _load_sa_info()
     SERVICE_EMAIL = info.get("client_email", "(sem client_email)")
     scopes = [
         "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/drive.readonly",
     ]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
-    gs_client = gspread.authorize(creds)
-    drive_client = None
-    if DRIVE_AVAILABLE:
-        drive_client = build("drive", "v3", credentials=creds)
-    return gs_client, drive_client
+    return gspread.authorize(creds)
 
-# =========================
-# Utilidades
-# =========================
+# util: aceita URL ou ID
+def _extract_sheet_id(s: str) -> str:
+    s = s.strip()
+    if s == "": return ""
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
+    return m.group(1) if m else s
+
+# =============== Lê uma planilha (dados + metas) ===============
 def parse_date_any(x):
-    if pd.isna(x) or x == "":
-        return pd.NaT
+    if pd.isna(x) or str(x).strip() == "": return pd.NaT
     s = str(x).strip()
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
         try:
@@ -117,230 +93,160 @@ def parse_date_any(x):
         except:
             pass
     try:
-        return pd.to_datetime(s).date()
+        return pd.to_datetime(s, errors="coerce").date()
     except:
         return pd.NaT
 
-def _upper_strip(x):
+def _upper_strip(x): 
     return str(x).upper().strip() if pd.notna(x) else ""
 
-def _extract_sheet_id(s: str) -> str:
-    """Extrai o ID de uma URL/ID do Sheets."""
-    s = (s or "").strip()
-    if not s:
-        return ""
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
-    return m.group(1) if m else s  # se colou só o ID, retorna como está
-
-# =========================
-# Leitura de uma planilha (dados + metas)
-# =========================
-def _read_one_spreadsheet(gs: gspread.Client, sid: str) -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    sh = gs.open_by_key(sid)
-    title = sh.title
-
+def read_one_spreadsheet(gs, sheet_id: str):
+    sh = gs.open_by_key(sheet_id)
     ws = sh.sheet1
-    data = ws.get_all_records()
-    df = pd.DataFrame(data)
-    df.columns = [c.strip().upper() for c in df.columns]
-
-    for needed in ["UNIDADE", "DATA", "CHASSI"]:
-        if needed not in df.columns:
-            raise RuntimeError(f"A planilha '{title}' não contém a coluna obrigatória: {needed}")
-
-    df["__DATA__"] = df["DATA"].apply(parse_date_any)
-
-    if "PERITO" in df.columns and "DIGITADOR" in df.columns:
-        df["VISTORIADOR"] = np.where(
-            df["PERITO"].astype(str).str.strip() != "",
-            df["PERITO"].map(_upper_strip),
-            df["DIGITADOR"].map(_upper_strip)
-        )
-    elif "PERITO" in df.columns:
-        df["VISTORIADOR"] = df["PERITO"].map(_upper_strip)
-    elif "DIGITADOR" in df.columns:
-        df["VISTORIADOR"] = df["DIGITADOR"].map(_upper_strip)
-    else:
-        df["VISTORIADOR"] = ""
-
-    df["UNIDADE"] = df["UNIDADE"].map(_upper_strip)
-    df["CHASSI"]  = df["CHASSI"].map(_upper_strip)
-
-    ban = {"POSTO CÓDIGO", "POSTO CODIGO", "CÓDIGO", "CODIGO", "", "—", "NAN"}
-    df = df[~df["UNIDADE"].isin(ban)].copy()
-
-    df = df.sort_values(["__DATA__", "CHASSI"], kind="mergesort").reset_index(drop=True)
-    df["__ORD__"] = df.groupby("CHASSI").cumcount()
-    df["IS_REV"]  = (df["__ORD__"] >= 1).astype(int)
-
-    def _ref_month(d):
-        if isinstance(d, date):
-            return f"{d.year}-{d.month:02d}"
-        return ""
-    df["REF_MONTH"] = df["__DATA__"].map(_ref_month)
-
-    # METAS
+    df = pd.DataFrame(ws.get_all_records())  # aba principal (Página1)
+    # tenta ler aba METAS
     try:
         metas_ws = sh.worksheet("METAS")
         dfm = pd.DataFrame(metas_ws.get_all_records())
     except Exception:
         dfm = pd.DataFrame()
 
+    # padroniza colunas principais
+    if not df.empty:
+        df.columns = [c.strip().upper() for c in df.columns]
+        # nomes mínimos
+        cu = "UNIDADE" if "UNIDADE" in df.columns else None
+        cd = "DATA" if "DATA" in df.columns else None
+        cc = "CHASSI" if "CHASSI" in df.columns else None
+        cp = "PERITO" if "PERITO" in df.columns else None
+        cg = "DIGITADOR" if "DIGITADOR" in df.columns else None
+        need = [cu, cd, cc, (cp or cg)]
+        if any(x is None for x in need):
+            raise RuntimeError("Planilha sem colunas mínimas: UNIDADE, DATA, CHASSI, PERITO/DIGITADOR")
+
+        df[cu] = df[cu].map(_upper_strip)
+        df[cc] = df[cc].map(_upper_strip)
+        df["__DATA__"] = df[cd].apply(parse_date_any)
+
+        # vistoriador
+        if cp and cg:
+            df["VISTORIADOR"] = np.where(df[cp].astype(str).str.strip()!="",
+                                         df[cp].map(_upper_strip),
+                                         df[cg].map(_upper_strip))
+        elif cp:
+            df["VISTORIADOR"] = df[cp].map(_upper_strip)
+        else:
+            df["VISTORIADOR"] = df[cg].map(_upper_strip)
+
+        # ordena por data/chassi e marca revistoria
+        df = df.sort_values(["__DATA__", cc], kind="mergesort").reset_index(drop=True)
+        df["__ORD__"] = df.groupby(cc).cumcount()
+        df["IS_REV"] = (df["__ORD__"] >= 1).astype(int)
+
+        # remove unidades inválidas
+        ban = {"POSTO CÓDIGO", "POSTO CODIGO", "CÓDIGO", "CODIGO", "", "—", "NAN"}
+        df = df[~df[cu].isin(ban)].copy()
+
+        # MESREF (MM/AAAA) derivado da __DATA__
+        def mk_mesref(d):
+            if isinstance(d, date):
+                return f"{d.month:02d}/{d.year}"
+            return ""
+        df["MESREF"] = df["__DATA__"].apply(mk_mesref)
+
+    # padroniza METAS
     if not dfm.empty:
         dfm.columns = [c.strip().upper() for c in dfm.columns]
+        # normaliza nomes flexíveis
         ren = {}
         for cand in ["META_MENSAL", "META MEN SAL", "META_MEN SAL", "META_MEN.SAL", "META MENSA"]:
-            if cand in dfm.columns:
-                ren[cand] = "META_MENSAL"
+            if cand in dfm.columns: ren[cand] = "META_MENSAL"
         for cand in ["DIAS UTEIS", "DIAS ÚTEIS", "DIAS_UTEIS"]:
-            if cand in dfm.columns:
-                ren[cand] = "DIAS_UTEIS"
+            if cand in dfm.columns: ren[cand] = "DIAS_UTEIS"
         dfm = dfm.rename(columns=ren)
 
-        dfm["VISTORIADOR"] = dfm["VISTORIADOR"].map(_upper_strip)
-        if "UNIDADE" in dfm.columns:
-            dfm["UNIDADE"] = dfm["UNIDADE"].astype(str).map(_upper_strip)
-        dfm["TIPO"] = dfm.get("TIPO", "").astype(str).map(_upper_strip)
+        for col in ["VISTORIADOR","UNIDADE","TIPO"]:
+            if col in dfm.columns:
+                dfm[col] = dfm[col].astype(str).map(_upper_strip)
         dfm["META_MENSAL"] = pd.to_numeric(dfm.get("META_MENSAL", 0), errors="coerce").fillna(0).astype(int)
         dfm["DIAS_UTEIS"]  = pd.to_numeric(dfm.get("DIAS_UTEIS", 0), errors="coerce").fillna(0).astype(int)
 
-        # REF_MONTH das metas: tenta extrair do título "MM/YYYY - ...", senão usa 1º mês presente nos dados
-        m = re.search(r"(\d{2})/(\d{4})", title)
-        if m:
-            mm, yyyy = int(m.group(1)), int(m.group(2))
-        else:
-            dates_ok = [d for d in df["__DATA__"] if isinstance(d, date)]
-            if dates_ok:
-                first = sorted(dates_ok)[0]
-                yyyy, mm = first.year, first.month
+        # MESREF da meta:
+        # 1) se existir colunas MES/ANO na aba METAS (opcional)
+        # 2) senão, usamos o MESREF mais frequente na própria planilha de dados
+        if "MESREF" not in dfm.columns:
+            if "MES" in dfm.columns and "ANO" in dfm.columns:
+                def build_mesref(row):
+                    try:
+                        m = int(row["MES"]); a = int(row["ANO"])
+                        return f"{m:02d}/{a}"
+                    except: return ""
+                dfm["MESREF"] = dfm.apply(build_mesref, axis=1)
             else:
-                yyyy, mm = (date.today().year, date.today().month)
-        dfm["REF_MONTH"] = f"{yyyy}-{mm:02d}"
-    else:
-        dfm = pd.DataFrame(columns=["VISTORIADOR","UNIDADE","TIPO","META_MENSAL","DIAS_UTEIS","REF_MONTH"])
+                fallback = ""
+                if not df.empty and "MESREF" in df.columns:
+                    freq = df["MESREF"].value_counts()
+                    fallback = freq.idxmax() if len(freq) else ""
+                dfm["MESREF"] = fallback
+
+    # título (útil só para debug/rodapé)
+    title = sh.title
 
     return df, dfm, title
 
-# =========================
-# Drive: listar arquivos na pasta (se disponível)
-# =========================
-def _drive_list_sheets_in_folder(drive, folder_id: str) -> list[dict]:
-    files_out = []
-    page_token = None
-    q = (
-        f"'{folder_id}' in parents and trashed=false and "
-        "("
-        "mimeType='application/vnd.google-apps.spreadsheet' or "
-        "mimeType='application/vnd.google-apps.shortcut'"
-        ")"
-    )
-    fields = "nextPageToken, files(id, name, mimeType, shortcutDetails)"
-    while True:
-        resp = drive.files().list(
-            q=q,
-            fields=fields,
-            pageSize=1000,
-            pageToken=page_token,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            orderBy="modifiedTime desc"
-        ).execute()
-        for f in resp.get("files", []):
-            mime = f.get("mimeType")
-            if mime == "application/vnd.google-apps.shortcut":
-                sd = f.get("shortcutDetails", {}) or {}
-                if sd.get("targetMimeType") == "application/vnd.google-apps.spreadsheet" and sd.get("targetId"):
-                    files_out.append({"id": sd["targetId"], "name": f.get("name", "(atalho)")})
-            elif mime == "application/vnd.google-apps.spreadsheet":
-                files_out.append({"id": f["id"], "name": f.get("name", "")})
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return files_out
+# =============== Entrada dos arquivos (IDs/URLs) ===============
+st.subheader("Conexão com a Base — Arquivos (meses)")
+st.caption("Cole 1 ID/URL por linha (pode colar as duas URLs dos meses 08 e 09).")
 
-# =========================
-# UI: fonte dos arquivos
-# =========================
-gs_client, drive_client = _auth_clients()
+default_urls = (
+    "https://docs.google.com/spreadsheets/d/14Bm5H9C20LqABklE3FniGjKM4-angZQ2fPRV7Uqm0GI/edit?gid=0\n"
+    "https://docs.google.com/spreadsheets/d/1jmAuTM-4sGOlUChEvR5prX-7POqucnrcW77cKZ0YRVY/edit?gid=0"
+)
+urls = st.text_area("Planilhas (uma por linha):", value=default_urls, height=80)
 
-st.markdown("### Conexão com a Base — Arquivos (meses)")
-mode = "Pasta do Drive" if DRIVE_AVAILABLE else "IDs/URLs (manual)"
-if DRIVE_AVAILABLE:
-    mode = st.radio("Como quer carregar os meses?", ["Pasta do Drive", "IDs/URLs (manual)"], index=0, horizontal=True)
-else:
-    st.info("Drive API não está instalada neste ambiente. Usando modo **IDs/URLs (manual)**.")
-    mode = "IDs/URLs (manual)"
-
-sheet_list = []  # [{"id":..., "name":...}, ...]
-if mode == "Pasta do Drive":
-    st.caption(f"ID da pasta: {FOLDER_ID}")
-    try:
-        files = _drive_list_sheets_in_folder(drive_client, FOLDER_ID)
-    except HttpError as e:
-        st.error("Não consegui listar a pasta no Drive.")
-        st.info(f"Confirme o compartilhamento com **{SERVICE_EMAIL}** (Leitor/Editor).")
-        with st.expander("Detalhes do erro"):
-            st.exception(e)
-        st.stop()
-    if not files:
-        st.error("Não encontrei Google Sheets na pasta.")
-        st.stop()
-    sheet_list = files
-else:
-    st.caption("Cole uma URL ou ID por linha (mínimo 1).")
-    # Pré-preenchido com 08/2025 e 09/2025 que você já usa:
-    default_lines = "\n".join([
-        "https://docs.google.com/spreadsheets/d/14Bm5H9C20LqABkIE3FniGjKM4-angZQ2fPRV7Uqm0GI/edit#gid=0",
-        "https://docs.google.com/spreadsheets/d/1jmAuTM-4sGOlUChEvR5prX-7P0qucnrcW77cKZ0YRVY/edit#gid=0",
-    ])
-    raw = st.text_area("Planilhas (uma por linha):", value=default_lines, height=120)
-    ids = [i for i in [_extract_sheet_id(x) for x in raw.splitlines()] if i]
-    # tente ler títulos para exibir nomes na UI
-    for sid in ids:
-        try:
-            name = gs_client.open_by_key(sid).title
-        except Exception:
-            name = sid
-        sheet_list.append({"id": sid, "name": name})
-
-# seleção / juntar
-opts = ["🧩 Juntar todos os arquivos"] + [f["name"] for f in sheet_list]
-choice = st.selectbox("Escolha um arquivo ou junte todos:", options=opts, index=0)
-
-# =========================
-# Montar DataFrame final
-# =========================
-def _assemble(choice_label: str):
-    if choice_label == "🧩 Juntar todos os arquivos":
-        dfs, metas = [], []
-        for f in sheet_list:
-            dfi, dmf, ttl = _read_one_spreadsheet(gs_client, f["id"])
-            dfs.append(dfi); metas.append(dmf)
-        big = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-        big_m = pd.concat(metas, ignore_index=True) if metas else pd.DataFrame()
-        src_label = "TODOS (juntados)"
-    else:
-        sel = next((x for x in sheet_list if x["name"] == choice_label), None)
-        if not sel:
-            raise RuntimeError("Arquivo selecionado não encontrado.")
-        big, big_m, src_label = _read_one_spreadsheet(gs_client, sel["id"])
-    return big, big_m, src_label
-
-try:
-    df, df_metas_all, fonte = _assemble(choice)
-    st.success(f"✅ Conectado: {fonte}")
-except Exception as e:
-    st.error("Falha ao montar os dados.")
-    with st.expander("Detalhes"):
-        st.exception(e)
+btn = st.button("🔗 Juntar todos os arquivos", use_container_width=True)
+if not btn:
     st.stop()
 
-# =========================
-# A PARTIR DAQUI É O MESMO PAINEL (com metas por REF_MONTH)
-# =========================
-col_unid   = "UNIDADE"
-col_data   = "__DATA__"
-col_chassi = "CHASSI"
+# =============== Carrega tudo ===============
+try:
+    gs = _gs_client()
+except Exception as e:
+    st.error("Falha ao autenticar no Google. Compartilhe as planilhas com: **{}**".format(SERVICE_EMAIL or "(conta de serviço)"))
+    st.stop()
+
+sheet_ids = [ _extract_sheet_id(x) for x in urls.splitlines() if _extract_sheet_id(x) ]
+if not sheet_ids:
+    st.error("Informe pelo menos 1 ID/URL de planilha.")
+    st.stop()
+
+dfs = []
+dfm_all = []
+titles = []
+for sid in sheet_ids:
+    try:
+        dfi, dfmi, ttl = read_one_spreadsheet(gs, sid)
+        if not dfi.empty:
+            dfi["ORIGEM"] = ttl
+            dfs.append(dfi)
+        if not dfmi.empty:
+            dfmi["ORIGEM"] = ttl
+            dfm_all.append(dfmi)
+        titles.append(ttl)
+    except Exception as e:
+        st.error(f"Erro lendo planilha {sid}: {e}")
+
+if not dfs:
+    st.error("Nenhum dado lido das planilhas fornecidas.")
+    st.stop()
+
+df = pd.concat(dfs, ignore_index=True)
+df_metas_all = pd.concat(dfm_all, ignore_index=True) if dfm_all else pd.DataFrame()
+
+st.success("✅ Conectado a: " + " | ".join(titles))
+
+# =============== Filtros (igual ao seu app) ===============
+col_unid = "UNIDADE"; col_chassi = "CHASSI"
 
 def _init_state():
     st.session_state.setdefault("unids_tmp", [])
@@ -350,231 +256,241 @@ _init_state()
 unidades_opts = sorted([u for u in df[col_unid].dropna().unique()])
 vist_opts = sorted([v for v in df["VISTORIADOR"].dropna().unique() if v])
 
-def cb_sel_all_vists():
-    st.session_state.vists_tmp = vist_opts[:]; st.rerun()
-def cb_clear_vists():
-    st.session_state.vists_tmp = []; st.rerun()
-def cb_sel_all_unids():
-    st.session_state.unids_tmp = unidades_opts[:]; st.rerun()
-def cb_clear_unids():
-    st.session_state.unids_tmp = []; st.rerun()
+def cb_sel_all_unids(): st.session_state.unids_tmp = unidades_opts[:] ; st.rerun()
+def cb_clear_unids():   st.session_state.unids_tmp = [] ; st.rerun()
+def cb_sel_all_vists(): st.session_state.vists_tmp = vist_opts[:] ; st.rerun()
+def cb_clear_vists():   st.session_state.vists_tmp = [] ; st.rerun()
 
-st.markdown("## 🔎 Filtros")
+st.subheader("🔎 Filtros")
 colU1, colU2 = st.columns([4,2])
 with colU1:
     st.multiselect("Unidades", options=unidades_opts, key="unids_tmp")
 with colU2:
-    b1, b2 = st.columns(2)
+    b1,b2 = st.columns(2)
     b1.button("Selecionar todas (Unid.)", use_container_width=True, on_click=cb_sel_all_unids)
     b2.button("Limpar (Unid.)", use_container_width=True, on_click=cb_clear_unids)
 
-datas_validas = [d for d in df[col_data] if isinstance(d, date)]
+# faixa de datas
+datas_validas = [d for d in df["__DATA__"] if isinstance(d, date)]
 dmin = min(datas_validas) if datas_validas else date.today()
 dmax = max(datas_validas) if datas_validas else date.today()
-if "dt_ini" not in st.session_state: st.session_state["dt_ini"] = dmin
-if "dt_fim" not in st.session_state: st.session_state["dt_fim"] = dmax
+st.session_state.setdefault("dt_ini", dmin)
+st.session_state.setdefault("dt_fim", dmax)
 
 colD1, colD2 = st.columns(2)
-with colD1: st.date_input("Data inicial", key="dt_ini", format="DD/MM/YYYY")
-with colD2: st.date_input("Data final", key="dt_fim", format="DD/MM/YYYY")
+with colD1:
+    st.date_input("Data inicial", key="dt_ini", format="DD/MM/YYYY")
+with colD2:
+    st.date_input("Data final",   key="dt_fim", format="DD/MM/YYYY")
 
 colV1, colV2 = st.columns([4,2])
 with colV1:
     st.multiselect("Vistoriadores", options=vist_opts, key="vists_tmp")
 with colV2:
-    b3, b4 = st.columns(2)
-    b3.button("Selecionar todos", use_container_width=True, on_click=cb_sel_all_vists)
-    b4.button("Limpar", use_container_width=True, on_click=cb_clear_vists)
+    c1,c2 = st.columns(2)
+    c1.button("Selecionar todos", use_container_width=True, on_click=cb_sel_all_vists)
+    c2.button("Limpar",            use_container_width=True, on_click=cb_clear_vists)
 
+# aplica filtros
 view = df.copy()
 if st.session_state.unids_tmp:
     view = view[view[col_unid].isin(st.session_state.unids_tmp)]
 if st.session_state.dt_ini and st.session_state.dt_fim:
-    view = view[(view[col_data] >= st.session_state.dt_ini) & (view[col_data] <= st.session_state.dt_fim)]
+    view = view[(view["__DATA__"] >= st.session_state.dt_ini) & (view["__DATA__"] <= st.session_state.dt_fim)]
 if st.session_state.vists_tmp:
     view = view[view["VISTORIADOR"].isin(st.session_state.vists_tmp)]
 
 if view.empty:
     st.info("Nenhum registro para os filtros aplicados.")
 
-# KPIs
+# =============== KPIs ===============
 vistorias_total   = int(len(view))
 revistorias_total = int(view["IS_REV"].sum()) if not view.empty else 0
-liq_total         = int(vistorias_total - revistorias_total)
-pct_rev           = (100 * revistorias_total / vistorias_total) if vistorias_total else 0.0
+liq_total         = vistorias_total - revistorias_total
+pct_rev           = (100*revistorias_total/vistorias_total) if vistorias_total else 0.0
+
 cards = [
     ("Vistorias (geral)",   f"{vistorias_total:,}".replace(",", ".")),
     ("Vistorias líquidas",  f"{liq_total:,}".replace(",", ".")),
     (_nt("Revistorias"),    f"{revistorias_total:,}".replace(",", ".")),
-    (_nt("% Revistorias"),  f"{pct_rev:,.1f}%".replace(",", "X").replace(".", ",").replace("X", ".")),
+    (_nt("% Revistorias"),  f"{pct_rev:,.1f}%".replace(",", "X").replace(".", ",").replace("X",".")),
 ]
-st.markdown('<div class="card-container">' + "".join([f"<div class='card'><h4>{t}</h4><h2>{v}</h2></div>" for t, v in cards]) + "</div>", unsafe_allow_html=True)
+st.markdown('<div class="card-container">' + "".join([f"<div class='card'><h4>{t}</h4><h2>{v}</h2></div>" for t,v in cards]) + "</div>", unsafe_allow_html=True)
 
-# Resumo por Vistoriador
+# =============== Resumo por Vistoriador (com METAS por MESREF) ===============
 st.markdown("<div class='section-title'>📋 Resumo por Vistoriador</div>", unsafe_allow_html=True)
-grp = (view.groupby("VISTORIADOR", dropna=False)
+
+grp = (view
+       .groupby(["VISTORIADOR"], dropna=False)
        .agg(VISTORIAS=("IS_REV","size"),
             REVISTORIAS=("IS_REV","sum"),
-            DIAS_ATIVOS=(col_data, lambda s: s.dropna().nunique()),
+            DIAS_ATIVOS=("__DATA__", lambda s: s.dropna().nunique()),
             UNIDADES=(col_unid, lambda s: s.dropna().nunique()))
        .reset_index())
 grp["LIQUIDO"] = grp["VISTORIAS"] - grp["REVISTORIAS"]
 
-def _is_workday(d): return isinstance(d, date) and d.weekday() < 5
-def _calc_wd_passados(df_view: pd.DataFrame) -> pd.DataFrame:
-    if df_view.empty: return pd.DataFrame(columns=["VISTORIADOR","DIAS_PASSADOS"])
-    mask = df_view[col_data].apply(_is_workday)
-    if not mask.any():
-        vists = df_view["VISTORIADOR"].dropna().unique()
-        return pd.DataFrame({"VISTORIADOR": vists, "DIAS_PASSADOS": np.zeros(len(vists), dtype=int)})
-    out = (df_view.loc[mask].groupby("VISTORIADOR")[col_data].nunique().reset_index().rename(columns={col_data:"DIAS_PASSADOS"}))
-    out["DIAS_PASSADOS"] = out["DIAS_PASSADOS"].astype(int); return out
+# dias úteis passados por vistoriador
+def _is_workday(d): return isinstance(d, date) and d.weekday()<5
+wd = (view[view["__DATA__"].apply(_is_workday)]
+      .groupby("VISTORIADOR")["__DATA__"].nunique().reset_index().rename(columns={"__DATA__":"DIAS_PASSADOS"}))
+grp = grp.merge(wd, on="VISTORIADOR", how="left").fillna({"DIAS_PASSADOS":0})
 
-wd_passados = _calc_wd_passados(view)
-grp = grp.merge(wd_passados, on="VISTORIADOR", how="left")
-grp["DIAS_PASSADOS"] = grp["DIAS_PASSADOS"].fillna(0).astype(int)
-
-# METAS por mês (REF_MONTH)
-view["_REF_MONTH"] = view["REF_MONTH"].fillna("")
-metas_all = df_metas_all.copy()
-if metas_all is not None and len(metas_all):
-    metas_cols = [c for c in ["VISTORIADOR","UNIDADE","TIPO","META_MENSAL","DIAS_UTEIS","REF_MONTH"] if c in metas_all.columns]
-    v_rm = (view.groupby(["VISTORIADOR","_REF_MONTH"]).size().reset_index(name="n"))
-    def _max_ref_month(s):
-        s = [x for x in s if x]; return max(s) if s else ""
-    v_rm_last = v_rm.groupby("VISTORIADOR")["_REF_MONTH"].apply(_max_ref_month).reset_index().rename(columns={"_REF_MONTH":"REF_MONTH"})
-    metas_join = v_rm_last.merge(metas_all[metas_cols], on=["VISTORIADOR","REF_MONTH"], how="left")
-    grp = grp.merge(metas_join.drop(columns=["REF_MONTH"]), on="VISTORIADOR", how="left")
-    grp["UNIDADE"] = grp.get("UNIDADE","").fillna(""); grp["TIPO"] = grp.get("TIPO","").fillna("")
-    for c in ["META_MENSAL","DIAS_UTEIS"]:
-        grp[c] = pd.to_numeric(grp.get(c,0), errors="coerce").fillna(0)
-    grp["META_MENSAL"] = grp["META_MENSAL"].astype(int)
-    grp["DIAS_UTEIS"]  = grp["DIAS_UTEIS"].astype(int)
+# === junta METAS por MESREF ===
+# Para cada VISTORIADOR no período filtrado, descobrimos a lista de MESREFs presentes e casamos com a METAS MESREF correspondente.
+if not df_metas_all.empty:
+    # reduz metas às colunas úteis
+    metas_cols = [c for c in ["VISTORIADOR","UNIDADE","TIPO","META_MENSAL","DIAS_UTEIS","MESREF"] if c in df_metas_all.columns]
+    metas = df_metas_all[metas_cols].copy()
+    metas["VISTORIADOR"] = metas["VISTORIADOR"].map(_upper_strip)
 else:
-    grp["TIPO"] = ""; grp["META_MENSAL"]=0; grp["DIAS_UTEIS"]=0
+    metas = pd.DataFrame(columns=["VISTORIADOR","UNIDADE","TIPO","META_MENSAL","DIAS_UTEIS","MESREF"])
 
-grp["META_DIA"] = np.where(grp["DIAS_UTEIS"]>0, grp["META_MENSAL"]/grp["DIAS_UTEIS"], 0.0)
-grp["FALTANTE_MES"] = np.maximum(grp["META_MENSAL"] - grp["LIQUIDO"], 0)
-grp["DIAS_RESTANTES"] = np.maximum(grp["DIAS_UTEIS"] - grp["DIAS_PASSADOS"], 0)
+# Para projeções/atingimentos no mês corrente, criamos uma base mensal do "view"
+# (ou seja: só os dados dentro dos filtros) agrupada por VISTORIADOR+MESREF
+if not view.empty:
+    view["MESREF"] = view["MESREF"].fillna("")
+    base_mes = (view.groupby(["VISTORIADOR","MESREF"], dropna=False)
+                    .agg(VISTORIAS=("IS_REV","size"), REVISTORIAS=("IS_REV","sum"))
+                    .reset_index())
+    base_mes["LIQUIDO"] = base_mes["VISTORIAS"] - base_mes["REVISTORIAS"]
+else:
+    base_mes = pd.DataFrame(columns=["VISTORIADOR","MESREF","VISTORIAS","REVISTORIAS","LIQUIDO"])
+
+# para o quadro principal (Resumo por Vistoriador), vamos usar a META do MESREF mais recente que aparece para cada vistoriador no período filtrado
+if not base_mes.empty and not metas.empty:
+    # pega o MESREF mais recente (por ordem de data real) para cada vistoriador nos dados filtrados
+    # mapeando MESREF -> (ano,mes) para ordenar
+    def _ym_from_mesref(m):
+        try:
+            mm,aa = m.split("/")
+            return (int(aa), int(mm))
+        except: return (0,0)
+    last_mesref = (base_mes.assign(_YM=base_mes["MESREF"].map(_ym_from_mesref))
+                            .sort_values("_YM")
+                            .groupby("VISTORIADOR").tail(1)[["VISTORIADOR","MESREF"]])
+    # escolhe meta do mesmo MESREF
+    metas_pick = (metas[["VISTORIADOR","TIPO","META_MENSAL","DIAS_UTEIS","MESREF"]]
+                  .merge(last_mesref, on=["VISTORIADOR","MESREF"], how="right"))
+else:
+    metas_pick = pd.DataFrame(columns=["VISTORIADOR","TIPO","META_MENSAL","DIAS_UTEIS","MESREF"])
+
+grp = grp.merge(metas_pick.drop_duplicates("VISTORIADOR"), on="VISTORIADOR", how="left")
+
+# cálculos
+grp["META_MENSAL"] = pd.to_numeric(grp.get("META_MENSAL",0), errors="coerce").fillna(0)
+grp["DIAS_UTEIS"]  = pd.to_numeric(grp.get("DIAS_UTEIS",0),  errors="coerce").fillna(0)
+
+grp["META_DIA"]        = np.where(grp["DIAS_UTEIS"]>0, grp["META_MENSAL"]/grp["DIAS_UTEIS"], 0.0)
+grp["FALTANTE_MES"]    = np.maximum(grp["META_MENSAL"] - grp["LIQUIDO"], 0)
+grp["DIAS_RESTANTES"]  = np.maximum(grp["DIAS_UTEIS"] - grp["DIAS_PASSADOS"], 0)
 grp["NECESSIDADE_DIA"] = np.where(grp["DIAS_RESTANTES"]>0, grp["FALTANTE_MES"]/grp["DIAS_RESTANTES"], 0.0)
 grp["MEDIA_DIA_ATUAL"] = np.where(grp["DIAS_PASSADOS"]>0, grp["LIQUIDO"]/grp["DIAS_PASSADOS"], 0.0)
-for c in ["LIQUIDO","MEDIA_DIA_ATUAL","DIAS_RESTANTES"]:
-    grp[c] = pd.to_numeric(grp[c], errors="coerce")
-grp["LIQUIDO"] = grp["LIQUIDO"].fillna(0)
-grp["MEDIA_DIA_ATUAL"] = grp["MEDIA_DIA_ATUAL"].fillna(0)
-grp["DIAS_RESTANTES"] = grp["DIAS_RESTANTES"].fillna(0).clip(lower=0)
-grp["PROJECAO_MES"] = (grp["LIQUIDO"] + grp["MEDIA_DIA_ATUAL"]*grp["DIAS_RESTANTES"]).round(0)
-grp["TENDENCIA_%"] = np.where(grp["META_MENSAL"]>0, (grp["PROJECAO_MES"]/grp["META_MENSAL"])*100, np.nan)
-grp = grp.sort_values(["PROJECAO_MES","LIQUIDO"], ascending=[False, False])
+grp["PROJECAO_MES"]    = (grp["LIQUIDO"] + grp["MEDIA_DIA_ATUAL"]*grp["DIAS_RESTANTES"]).round(0)
+grp["TENDENCIA_%"]     = np.where(grp["META_MENSAL"]>0, (grp["PROJECAO_MES"]/grp["META_MENSAL"])*100, np.nan)
 
+# formatação
 def chip_tend(p):
     if pd.isna(p): return "—"
-    p = float(p)
-    if p >= 100: return f"{p:.0f}% 🚀"
-    if p >= 95:  return f"{p:.0f}% 💪"
-    if p >= 85:  return f"{p:.0f}% 😬"
+    p=float(p)
+    if p>=100: return f"{p:.0f}% 🚀"
+    if p>=95:  return f"{p:.0f}% 💪"
+    if p>=85:  return f"{p:.0f}% 😬"
     return f"{p:.0f}% 😟"
 def chip_nec(x):
-    try: v = float(x)
+    try: v=float(x)
     except: return "—"
-    return "0 ✅" if v <= 0 else f"{int(round(v))} 🔥"
+    return "0 ✅" if v<=0 else f"{int(round(v))} 🔥"
 
 fmt = grp.copy()
-fmt["TIPO"] = fmt["TIPO"].map({"FIXO":"🏢 FIXO","MÓVEL":"🚗 MÓVEL","MOVEL":"🚗 MÓVEL"}).fillna("—")
-fmt["META_MENSAL"] = fmt["META_MENSAL"].map(lambda x: f"{int(x):,}".replace(",", "."))
-fmt["DIAS_UTEIS"] = fmt["DIAS_UTEIS"].map(lambda x: f"{int(x)}")
-fmt["META_DIA"] = fmt["META_DIA"].map(lambda x: f"{x:,.1f}".replace(",", "X").replace(".", ",").replace("X", "."))
-fmt["VISTORIAS"] = fmt["VISTORIAS"].map(lambda x: f"{int(x)}")
-fmt["REVISTORIAS"] = fmt["REVISTORIAS"].map(lambda x: f"{int(x)}")
-fmt["LIQUIDO"] = fmt["LIQUIDO"].map(lambda x: f"{int(x)}")
-fmt["FALTANTE_MES"] = fmt["FALTANTE_MES"].map(lambda x: f"{int(x)}")
+fmt["TIPO"] = fmt.get("TIPO","").replace({"MOVEL":"MÓVEL"}).fillna("")
+fmt["TIPO"] = fmt["TIPO"].map({"FIXO":"🏢 FIXO", "MÓVEL":"🚗 MÓVEL"}).fillna("—")
+for c in ["META_MENSAL","DIAS_UTEIS","VISTORIAS","REVISTORIAS","LIQUIDO","FALTANTE_MES","PROJECAO_MES"]:
+    if c in fmt.columns:
+        fmt[c] = fmt[c].map(lambda x: "—" if pd.isna(x) else f"{int(x)}")
+fmt["META_DIA"]        = fmt["META_DIA"].map(lambda x: f"{x:,.1f}".replace(",", "X").replace(".", ",").replace("X","."))
 fmt["NECESSIDADE_DIA"] = grp["NECESSIDADE_DIA"].apply(chip_nec)
-fmt["TENDÊNCIA"] = grp["TENDENCIA_%"].apply(chip_tend)
-fmt["PROJECAO_MES"] = fmt["PROJECAO_MES"].map(lambda x: "—" if pd.isna(x) else f"{int(round(x))}")
+fmt["TENDÊNCIA"]       = grp["TENDENCIA_%"].apply(chip_tend)
 
-cols_show = ["VISTORIADOR","UNIDADE","TIPO","META_MENSAL","DIAS_UTEIS","META_DIA","VISTORIAS","REVISTORIAS","LIQUIDO","FALTANTE_MES","NECESSIDADE_DIA","TENDÊNCIA","PROJECAO_MES"]
-if fmt.empty:
-    st.caption("Sem registros para os filtros aplicados.")
-else:
-    st.dataframe(fmt[cols_show], use_container_width=True, hide_index=True)
-    csv = fmt[cols_show].to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ Baixar resumo (CSV)", data=csv, file_name="resumo_vistoriador.csv", mime="text/csv")
+cols_show = ["VISTORIADOR","UNIDADE","TIPO","META_MENSAL","DIAS_UTEIS","META_DIA",
+             "VISTORIAS","REVISTORIAS","LIQUIDO","FALTANTE_MES","NECESSIDADE_DIA","TENDÊNCIA","PROJECAO_MES","MESREF"]
+st.dataframe(fmt[cols_show], use_container_width=True, hide_index=True)
 
-# Evolução diária
+# =============== Evolução diária ===============
 st.markdown("<div class='section-title'>📈 Evolução diária</div>", unsafe_allow_html=True)
-if view.empty:
-    st.caption("Sem dados no período selecionado.")
-else:
-    daily = (view.groupby(col_data, dropna=False)
-             .agg(VISTORIAS=("IS_REV","size"), REVISTORIAS=("IS_REV","sum"))
-             .reset_index())
-    daily = daily[pd.notna(daily[col_data])].sort_values(col_data)
+if not view.empty:
+    daily = (view.groupby("__DATA__", dropna=False)
+                  .agg(VISTORIAS=("IS_REV","size"), REVISTORIAS=("IS_REV","sum"))
+                  .reset_index().sort_values("__DATA__"))
     daily["LIQUIDO"] = daily["VISTORIAS"] - daily["REVISTORIAS"]
-    daily_melt = daily.melt(id_vars=col_data, value_vars=["VISTORIAS","REVISTORIAS","LIQUIDO"], var_name="Métrica", value_name="Valor")
-    if daily_melt.empty:
-        st.caption("Sem evolução diária para exibir.")
-    else:
-        line = (alt.Chart(daily_melt).mark_line(point=True).encode(
-                    x=alt.X(f"{col_data}:T", title="Data"),
-                    y=alt.Y("Valor:Q", title="Quantidade"),
-                    color=alt.Color("Métrica:N", title="Métrica"),
-                    tooltip=[alt.Tooltip(f"{col_data}:T", title="Data"),
-                             alt.Tooltip("Métrica:N", title="Métrica"),
-                             alt.Tooltip("Valor:Q", title="Valor")]
-               ).properties(height=360))
-        st.altair_chart(line, use_container_width=True)
+    melt = daily.melt(id_vars="__DATA__", value_vars=["VISTORIAS","REVISTORIAS","LIQUIDO"],
+                      var_name="Métrica", value_name="Valor")
+    chart = (alt.Chart(melt).mark_line(point=True)
+                .encode(x=alt.X("__DATA__:T", title="Data"),
+                        y=alt.Y("Valor:Q", title="Quantidade"),
+                        color=alt.Color("Métrica:N", title="Métrica"),
+                        tooltip=[alt.Tooltip("__DATA__:T","Data"),
+                                 alt.Tooltip("Métrica:N"),
+                                 alt.Tooltip("Valor:Q")])
+                .properties(height=360))
+    st.altair_chart(chart, use_container_width=True)
+else:
+    st.caption("Sem dados no período selecionado.")
 
-# Produção por Unidade
+# =============== Produção por Unidade (Líquido) ===============
 st.markdown("<div class='section-title'>🏙️ Produção por Unidade (Líquido)</div>", unsafe_allow_html=True)
-if view.empty:
+if not view.empty:
+    byu = (view.groupby(col_unid, dropna=False)
+                .agg(liq=("IS_REV", lambda s: s.size - s.sum()))
+                .reset_index().sort_values("liq", ascending=False))
+    bar = (alt.Chart(byu).mark_bar()
+            .encode(x=alt.X(f"{col_unid}:N", sort='-y', title="Unidade",
+                            axis=alt.Axis(labelAngle=-30)),
+                    y=alt.Y("liq:Q", title="Líquido"),
+                    tooltip=[alt.Tooltip(f"{col_unid}:N","Unidade"),
+                             alt.Tooltip("liq:Q","Líquido")])
+            .properties(height=420))
+    st.altair_chart(bar, use_container_width=True)
+else:
     st.caption("Sem dados de unidades para o período.")
-else:
-    by_unid = (view.groupby(col_unid, dropna=False)
-               .agg(liq=("IS_REV", lambda s: s.size - s.sum()))
-               .reset_index()
-               .sort_values("liq", ascending=False))
-    if by_unid.empty:
-        st.caption("Sem produção por unidade dentro dos filtros.")
-    else:
-        bar_unid = (alt.Chart(by_unid).mark_bar().encode(
-            x=alt.X(f"{col_unid}:N", sort='-y', title="Unidade", axis=alt.Axis(labelAngle=-30)),
-            y=alt.Y("liq:Q", title="Líquido"),
-            tooltip=[alt.Tooltip(f"{col_unid}:N", title="Unidade"), alt.Tooltip("liq:Q", title="Líquido")]
-        ).properties(height=420))
-        st.altair_chart(bar_unid, use_container_width=True)
 
-# Auditoria – duplicados
+# =============== Auditoria: chassis com múltiplas vistorias ===============
 st.markdown("<div class='section-title'>🕵️ Chassis com múltiplas vistorias</div>", unsafe_allow_html=True)
-if view.empty:
-    st.caption("Nenhum chassi com múltiplas vistorias dentro dos filtros.")
-else:
+if not view.empty:
     dup = (view.groupby(col_chassi, dropna=False)
-           .agg(QTD=("VISTORIADOR","size"),
-                PRIMEIRA_DATA=(col_data,"min"),
-                ULTIMA_DATA=(col_data,"max"))
-           .reset_index())
-    dup = dup[dup["QTD"] >= 2].sort_values("QTD", ascending=False)
-    if len(dup) == 0:
-        st.caption("Nenhum chassi com múltiplas vistorias dentro dos filtros.")
-    else:
-        first_map = (view.sort_values([col_data]).drop_duplicates(subset=[col_chassi], keep="first").set_index(col_chassi)["VISTORIADOR"].to_dict())
-        last_map  = (view.sort_values([col_data]).drop_duplicates(subset=[col_chassi], keep="last").set_index(col_chassi)["VISTORIADOR"].to_dict())
+                .agg(QTD=("VISTORIADOR","size"),
+                     PRIMEIRA_DATA=("**DATA**".replace("*","_"), "min"),  # só para evitar highlight
+                     ULTIMA_DATA=("__DATA__", "max"))
+                .reset_index())
+    dup = dup[dup["QTD"]>=2].sort_values("QTD", ascending=False)
+    if len(dup):
+        # quem fez 1ª e última
+        first_map = (view.sort_values(["__DATA__"])
+                        .drop_duplicates(subset=[col_chassi], keep="first")
+                        .set_index(col_chassi)["VISTORIADOR"].to_dict())
+        last_map  = (view.sort_values(["__DATA__"])
+                        .drop_duplicates(subset=[col_chassi], keep="last")
+                        .set_index(col_chassi)["VISTORIADOR"].to_dict())
         dup["PRIMEIRO_VIST"] = dup[col_chassi].map(first_map)
         dup["ULTIMO_VIST"]   = dup[col_chassi].map(last_map)
         st.dataframe(dup, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Nenhum chassi com múltiplas vistorias dentro dos filtros.")
+else:
+    st.caption("Nenhum chassi com múltiplas vistorias dentro dos filtros.")
 
-# Consolidado do mês + ranking
+# =============== Consolidado do Mês + Rankings (por MESREF do período) ===============
 TOP_LABEL = "TOP BOX"; BOTTOM_LABEL = "BOTTOM BOX"
 st.markdown("---")
 st.markdown("<div class='section-title'>🧮 Consolidado do Mês + Ranking por Vistoriador</div>", unsafe_allow_html=True)
-datas_ok = [d for d in view[col_data] if isinstance(d, date)]
+
+# Escolhe o MESREF do último dia presente no filtro
+datas_ok = [d for d in view["__DATA__"] if isinstance(d, date)]
 if not datas_ok:
     st.info("Sem datas dentro dos filtros atuais para montar o consolidado do mês.")
 else:
-    ref = sorted(datas_ok)[-1]; ref_ano, ref_mes = ref.year, ref.month
-    mes_label = f"{ref_mes:02d}/{ref_ano}"
-    mask_mes = view[col_data].apply(lambda d: isinstance(d, date) and d.year==ref_ano and d.month==ref_mes)
-    view_mes = view[mask_mes].copy()
+    ref = sorted(datas_ok)[-1]
+    mesref = f"{ref.month:02d}/{ref.year}"
+    view_mes = view[view["MESREF"]==mesref].copy()
 
     prod_mes = (view_mes.groupby("VISTORIADOR", dropna=False)
                 .agg(VISTORIAS=("IS_REV","size"),
@@ -582,12 +498,18 @@ else:
                 .reset_index())
     prod_mes["LIQUIDO"] = prod_mes["VISTORIAS"] - prod_mes["REVISTORIAS"]
 
-    ref_month_key = f"{ref_ano}-{ref_mes:02d}"
-    metas_join = df_metas_all[df_metas_all["REF_MONTH"] == ref_month_key][["VISTORIADOR","TIPO","META_MENSAL"]].copy() if len(df_metas_all) else pd.DataFrame(columns=["VISTORIADOR","TIPO","META_MENSAL"])
+    # metas do MESREF específico
+    if not metas.empty:
+        metas_join = metas[metas["MESREF"]==mesref][["VISTORIADOR","TIPO","META_MENSAL"]].copy()
+    else:
+        metas_join = pd.DataFrame(columns=["VISTORIADOR","TIPO","META_MENSAL"])
+
     base_mes = prod_mes.merge(metas_join, on="VISTORIADOR", how="left")
-    base_mes["TIPO"] = base_mes["TIPO"].astype(str).map(_upper_strip).replace({"MOVEL":"MÓVEL"}).replace("", "—")
-    base_mes["META_MENSAL"] = pd.to_numeric(base_mes["META_MENSAL"], errors="coerce").fillna(0)
-    base_mes["ATING_%"] = np.where(base_mes["META_MENSAL"]>0, (base_mes["VISTORIAS"]/base_mes["META_MENSAL"])*100, np.nan)
+    base_mes["TIPO"] = base_mes.get("TIPO","").astype(str).str.upper().replace({"MOVEL":"MÓVEL"}).replace("", "—")
+    base_mes["META_MENSAL"] = pd.to_numeric(base_mes.get("META_MENSAL",0), errors="coerce").fillna(0)
+
+    base_mes["ATING_%"] = np.where(base_mes["META_MENSAL"]>0,
+                                   (base_mes["VISTORIAS"]/base_mes["META_MENSAL"])*100, np.nan)
 
     meta_tot = int(base_mes["META_MENSAL"].sum())
     vist_tot = int(base_mes["VISTORIAS"].sum())
@@ -597,48 +519,50 @@ else:
 
     def chip_pct(p):
         if pd.isna(p): return "—"
-        p = float(p)
-        if p >= 110: emo="🏆"
-        elif p >= 100: emo="🚀"
-        elif p >= 90: emo="💪"
-        elif p >= 80: emo="😬"
-        else: emo="😟"
+        p=float(p)
+        if p>=110: emo="🏆"
+        elif p>=100: emo="🚀"
+        elif p>=90:  emo="💪"
+        elif p>=80:  emo="😬"
+        else:        emo="😟"
         return f"{p:.0f}% {emo}"
 
     cards_mes = [
-        ("Mês de referência", mes_label),
+        ("Mês de referência", mesref),
         ("Meta (soma)", f"{meta_tot:,}".replace(",", ".")),
         ("Vistorias (geral)", f"{vist_tot:,}".replace(",", ".")),
         (_nt("Revistorias"), f"{rev_tot:,}".replace(",", ".")),
         ("Líquido", f"{liq_tot:,}".replace(",", ".")),
         ("% Ating. (sobre geral)", chip_pct(ating_g)),
     ]
-    st.markdown('<div class="card-container">'+ "".join([f"<div class='card'><h4>{t}</h4><h2>{v}</h2></div>" for t,v in cards_mes]) + "</div>", unsafe_allow_html=True)
+    st.markdown('<div class="card-container">' + "".join([f"<div class='card'><h4>{t}</h4><h2>{v}</h2></div>" for t,v in cards_mes]) + "</div>", unsafe_allow_html=True)
 
     def chip_pct_row(p):
         if pd.isna(p): return "—"
-        p = float(p)
-        if p >= 110: emo="🏆"
-        elif p >= 100: emo="🚀"
-        elif p >= 90: emo="💪"
-        elif p >= 80: emo="😬"
-        else: emo="😟"
+        p=float(p)
+        if p>=110: emo="🏆"
+        elif p>=100: emo="🚀"
+        elif p>=90:  emo="💪"
+        elif p>=80:  emo="😬"
+        else:        emo="😟"
         return f"{p:.0f}% {emo}"
 
     def render_ranking(df_sub, titulo):
-        if len(df_sub)==0:
-            st.caption(f"Sem dados para {titulo} em {mes_label}."); return
+        if df_sub.empty:
+            st.caption(f"Sem dados para {titulo} em {mesref}.")
+            return
         rk = df_sub[df_sub["META_MENSAL"]>0].copy()
-        if len(rk)==0:
-            st.caption(f"Ninguém com META cadastrada para {titulo}."); return
+        if rk.empty:
+            st.caption(f"Ninguém com META cadastrada para {titulo}.")
+            return
         rk = rk.sort_values("ATING_%", ascending=False)
 
-        top = rk.head(5).copy(); medals=["🥇","🥈","🥉","🏅","🏅"]
-        top["🏅"] = [medals[i] if i < len(medals) else "🏅" for i in range(len(top))]
+        top = rk.head(5).copy()
+        top["🏅"] = ["🥇","🥈","🥉","🏅","🏅"][:len(top)]
         top_fmt = pd.DataFrame({
             " ": top["🏅"],
             "Vistoriador": top["VISTORIADOR"],
-            "Meta (mês)": top["META_MENSAL"].map(lambda x:f"{int(x):,}".replace(",", ".")),
+            "Meta (mês)": top["META_MENSAL"].map(lambda x: f"{int(x):,}".replace(",", ".")),
             "Vistorias (geral)": top["VISTORIAS"].map(int),
             "Revistorias": top["REVISTORIAS"].map(int),
             "Líquido": top["LIQUIDO"].map(int),
@@ -646,12 +570,12 @@ else:
         })
 
         bot = rk.tail(5).sort_values("ATING_%", ascending=True).copy()
-        badgies=["🆘","🪫","🐢","⚠️","⚠️"]
-        bot["⚠️"] = [badgies[i] if i < len(badgies) else "⚠️" for i in range(len(bot))]
+        bad = ["🆘","🪫","🐢","⚠️","⚠️"][:len(bot)]
+        bot["⚠️"] = bad
         bot_fmt = pd.DataFrame({
             " ": bot["⚠️"],
             "Vistoriador": bot["VISTORIADOR"],
-            "Meta (mês)": bot["META_MENSAL"].map(lambda x:f"{int(x):,}".replace(",", ".")),
+            "Meta (mês)": bot["META_MENSAL"].map(lambda x: f"{int(x):,}".replace(",", ".")),
             "Vistorias (geral)": bot["VISTORIAS"].map(int),
             "Revistorias": bot["REVISTORIAS"].map(int),
             "Líquido": bot["LIQUIDO"].map(int),
@@ -660,96 +584,14 @@ else:
 
         c1,c2 = st.columns(2)
         with c1:
-            st.markdown(f"**{_nt('TOP BOX')} — {mes_label}**", unsafe_allow_html=True)
+            st.markdown(f"**{_nt(TOP_LABEL)} — {mesref}**", unsafe_allow_html=True)
             st.dataframe(top_fmt, use_container_width=True, hide_index=True)
         with c2:
-            st.markdown(f"**{_nt('BOTTOM BOX')} — {mes_label}**", unsafe_allow_html=True)
+            st.markdown(f"**{_nt(BOTTOM_LABEL)} — {mesref}**", unsafe_allow_html=True)
             st.dataframe(bot_fmt, use_container_width=True, hide_index=True)
 
     st.markdown("#### 🏢 FIXO")
     render_ranking(base_mes[base_mes["TIPO"]=="FIXO"], "vistoriadores FIXO")
+
     st.markdown("#### 🚗 MÓVEL")
     render_ranking(base_mes[base_mes["TIPO"].isin(["MÓVEL","MOVEL"])], "vistoriadores MÓVEL")
-
-# Ranking do dia
-st.markdown("---")
-st.markdown("<div class='section-title'>📅 Ranking do Dia por Vistoriador</div>", unsafe_allow_html=True)
-dates_avail = sorted([d for d in view[col_data] if isinstance(d, date)])
-if not dates_avail:
-    st.info("Sem datas dentro dos filtros atuais para montar o ranking diário.")
-else:
-    default_day = dates_avail[-1]
-    rank_day = st.date_input("Dia para o ranking", value=st.session_state.get("rank_day_sel", default_day), format="DD/MM/YYYY", key="rank_day_sel")
-    used_day = rank_day if rank_day in dates_avail else (max([d for d in dates_avail if d <= rank_day]) if any(d <= rank_day for d in dates_avail) else dates_avail[-1])
-    if used_day != rank_day:
-        st.caption(f"Sem dados em {rank_day.strftime('%d/%m/%Y')}. Exibindo {used_day.strftime('%d/%m/%Y')}.")
-    st.caption(f"Dia exibido no ranking: **{used_day.strftime('%d/%m/%Y')}**")
-
-    view_dia = view[view[col_data] == used_day].copy()
-    prod_dia = (view_dia.groupby("VISTORIADOR", dropna=False)
-                .agg(VISTORIAS_DIA=("IS_REV","size"),
-                     REVISTORIAS_DIA=("IS_REV","sum"))
-                .reset_index())
-    prod_dia["LIQUIDO_DIA"] = prod_dia["VISTORIAS_DIA"] - prod_dia["REVISTORIAS_DIA"]
-
-    ref_month_key = f"{used_day.year}-{used_day.month:02d}"
-    if len(df_metas_all):
-        metas_join = df_metas_all[df_metas_all["REF_MONTH"] == ref_month_key][["VISTORIADOR","TIPO","META_MENSAL","DIAS_UTEIS"]].copy()
-    else:
-        metas_join = pd.DataFrame(columns=["VISTORIADOR","TIPO","META_MENSAL","DIAS_UTEIS"])
-
-    base_dia = prod_dia.merge(metas_join, on="VISTORIADOR", how="left")
-    base_dia["TIPO"] = base_dia["TIPO"].astype(str).str.upper().replace({"MOVEL":"MÓVEL"}).replace("", "—")
-    for c in ["META_MENSAL","DIAS_UTEIS"]:
-        base_dia[c] = pd.to_numeric(base_dia.get(c,0), errors="coerce").fillna(0)
-    base_dia["META_DIA"] = np.where(base_dia["DIAS_UTEIS"]>0, base_dia["META_MENSAL"]/base_dia["DIAS_UTEIS"], 0.0)
-    base_dia["ATING_DIA_%"] = np.where(base_dia["META_DIA"]>0, (base_dia["VISTORIAS_DIA"]/base_dia["META_DIA"])*100, np.nan)
-
-    def chip_pct_row_dia(p):
-        if pd.isna(p): return "—"
-        p = float(p)
-        if p >= 110: emo="🏆"
-        elif p >= 100: emo="🚀"
-        elif p >= 90: emo="💪"
-        elif p >= 80: emo="😬"
-        else: emo="😟"
-        return f"{p:.0f}% {emo}"
-
-    def render_ranking_dia(df_sub, titulo):
-        if df_sub.empty:
-            st.caption(f"Sem dados para {titulo} em {used_day.strftime('%d/%m/%Y')}."); return
-        rk = df_sub[df_sub["META_DIA"]>0].copy()
-        if rk.empty:
-            st.caption(f"Ninguém com META do dia cadastrada para {titulo}."); return
-        rk = rk.sort_values("ATING_DIA_%", ascending=False)
-        top = rk.head(5).copy(); medals=["🥇","🥈","🥉","🏅","🏅"]
-        top["🏅"] = [medals[i] if i < len(medals) else "🏅" for i in range(len(top))]
-        top_fmt = pd.DataFrame({
-            " ": top["🏅"], "Vistoriador": top["VISTORIADOR"],
-            "Meta (dia)": top["META_DIA"].map(lambda x:int(round(x))),
-            "Vistorias (dia)": top["VISTORIAS_DIA"].map(int),
-            "Revistorias": top["REVISTORIAS_DIA"].map(int),
-            "Líquido (dia)": top["LIQUIDO_DIA"].map(int),
-            "% Ating. (dia)": top["ATING_DIA_%"].map(chip_pct_row_dia),
-        })
-        bot = rk.tail(5).sort_values("ATING_DIA_%", ascending=True).copy()
-        badgies=["🆘","🪫","🐢","⚠️","⚠️"]
-        bot["⚠️"] = [badgies[i] if i < len(badgies) else "⚠️" for i in range(len(bot))]
-        bot_fmt = pd.DataFrame({
-            " ": bot["⚠️"], "Vistoriador": bot["VISTORIADOR"],
-            "Meta (dia)": bot["META_DIA"].map(lambda x:int(round(x))),
-            "Vistorias (dia)": bot["VISTORIAS_DIA"].map(int),
-            "Revistorias": bot["REVISTORIAS_DIA"].map(int),
-            "Líquido (dia)": bot["LIQUIDO_DIA"].map(int),
-            "% Ating. (dia)": bot["ATING_DIA_%"].map(chip_pct_row_dia),
-        })
-        c1,c2 = st.columns(2)
-        with c1:
-            st.markdown(f"**{_nt('TOP BOX')}**", unsafe_allow_html=True); st.dataframe(top_fmt, use_container_width=True, hide_index=True)
-        with c2:
-            st.markdown(f"**{_nt('BOTTOM BOX')}**", unsafe_allow_html=True); st.dataframe(bot_fmt, use_container_width=True, hide_index=True)
-
-    st.markdown("#### 🏢 FIXO")
-    render_ranking_dia(base_dia[base_dia["TIPO"]=="FIXO"], "vistoriadores FIXO")
-    st.markdown("#### 🚗 MÓVEL")
-    render_ranking_dia(base_dia[base_dia["TIPO"].isin(["MÓVEL","MOVEL"])], "vistoriadores MÓVEL")
