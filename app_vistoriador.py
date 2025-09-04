@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 # ------------------------------------------------------------
 # Painel de Produção por Vistoriador (Streamlit) - versão visual (emojis)
-# - Lê planilhas de uma PASTA do Google Drive (ID ou URL)
-# - Você escolhe o arquivo (mês) OU "todos os arquivos (juntar)"
-# - Reseta filtros ao trocar de arquivo
-# - Correções para sábados/domingos, merges, METAS opcional
+# - Lê planilhas Google Sheets de uma PASTA do Drive (ID ou URL)
+# - Permite escolher 1 arquivo (mês) ou "TODOS OS ARQUIVOS (juntar)"
+# - Filtros reativos + KPIs + gráficos + rankings mensal e do dia
+# - Robusto para atalhos (shortcuts), sábados/domingos e merges
 # ------------------------------------------------------------
 
 import os, json, re, requests
@@ -54,10 +54,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================
-# PASTA DO DRIVE (cole ID ou URL)
+# PASTA DO DRIVE (ID ou URL)
 # =========================
-FOLDER_ID_OR_URL = "https://drive.google.com/drive/folders/1rDeXts0WRA-lvx_FhqottTPEYf3Iqsql"
-SERVICE_EMAIL = "(carregando...)"
+# 👉 Use a URL/ID que você me mandou:
+FOLDER_ID = "https://drive.google.com/drive/folders/1rDeXts0WRA-lvx_FhqottTPEYf3Iqsql"
+SERVICE_EMAIL = None  # preenchido ao ler as credenciais
 
 # =========================
 # Autenticação & helpers
@@ -99,12 +100,10 @@ def _resolve_folder_id(val: str | None) -> str | None:
         return s
     return None
 
-@st.cache_data(ttl=300)
-def listar_planilhas_da_pasta(folder_id_or_url: str) -> list[dict]:
+def _drive_list_sheets_in_folder(folder_id: str) -> list[dict]:
     """
-    Lista Google Sheets dentro da pasta usando a API do Drive.
-    Retorna lista de dicts: {id, name, modifiedTime, createdTime}.
-    Ignora atalhos.
+    Lista Google Sheets (inclui atalhos para Sheets) dentro da pasta.
+    Retorna [{id, name, modifiedTime, createdTime}].
     """
     info, _ = _load_sa_info()
     scopes = [
@@ -114,20 +113,22 @@ def listar_planilhas_da_pasta(folder_id_or_url: str) -> list[dict]:
     creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
     token = creds.get_access_token().access_token
 
-    fid = _resolve_folder_id(folder_id_or_url)
+    fid = _resolve_folder_id(folder_id)
     if not fid:
         raise RuntimeError("FOLDER_ID inválido. Cole o ID OU a URL da pasta do Drive.")
 
-    url = "https://www.googleapis.com/drive/v3/files"
-    # mimeType de Google Sheets (não atalho)
+    # Query inclui planilhas e atalhos cujo destino é planilha
     q = (
-        f"'{fid}' in parents "
-        "and trashed=false "
-        "and (mimeType='application/vnd.google-apps.spreadsheet')"
+        f"'{fid}' in parents and trashed=false and ("
+        "mimeType='application/vnd.google-apps.spreadsheet' or "
+        "(mimeType='application/vnd.google-apps.shortcut' and "
+        "shortcutDetails/targetMimeType='application/vnd.google-apps.spreadsheet'))"
     )
+
+    url = "https://www.googleapis.com/drive/v3/files"
     params = {
         "q": q,
-        "fields": "files(id,name,modifiedTime,createdTime)",
+        "fields": "files(id,name,mimeType,modifiedTime,createdTime,shortcutDetails/targetId,shortcutDetails/targetMimeType)",
         "orderBy": "modifiedTime desc",
         "pageSize": 1000,
         "supportsAllDrives": True,
@@ -137,10 +138,31 @@ def listar_planilhas_da_pasta(folder_id_or_url: str) -> list[dict]:
     r = requests.get(url, params=params, headers=headers, timeout=30)
     r.raise_for_status()
     files = r.json().get("files", [])
-    return files
 
-def conectar_gsheets(sheet_id: str):
-    """Conecta em uma planilha (sheet_id) e devolve (worksheet sheet1, dataframe)."""
+    out = []
+    for f in files:
+        # Se for atalho, usar targetId
+        if f.get("mimeType") == "application/vnd.google-apps.shortcut":
+            tid = (f.get("shortcutDetails") or {}).get("targetId")
+            if not tid:
+                continue
+            out.append({
+                "id": tid,
+                "name": f"{f.get('name','(atalho)')}",
+                "modifiedTime": f.get("modifiedTime"),
+                "createdTime": f.get("createdTime"),
+            })
+        else:
+            out.append({
+                "id": f.get("id"),
+                "name": f.get("name"),
+                "modifiedTime": f.get("modifiedTime"),
+                "createdTime": f.get("createdTime"),
+            })
+    return out
+
+def _connect_sheet(sheet_id: str):
+    """Abre uma planilha pelo ID e devolve (worksheet sheet1, dataframe)."""
     global SERVICE_EMAIL
     info, _ = _load_sa_info()
     SERVICE_EMAIL = info.get("client_email", "(sem client_email)")
@@ -155,7 +177,7 @@ def conectar_gsheets(sheet_id: str):
         ws = sh.sheet1
         data = ws.get_all_records()
         df = pd.DataFrame(data)
-        return ws, df
+        return ws, df, sh
     except Exception as e:
         st.error("Não consegui ler a planilha.")
         st.info(f"Compartilhe com: **{SERVICE_EMAIL}** (Leitor/Editor).")
@@ -163,120 +185,7 @@ def conectar_gsheets(sheet_id: str):
             st.exception(e)
         st.stop()
 
-# --- Lê a aba METAS (opcional) ---
-def ler_aba_metas(worksheet_handle) -> pd.DataFrame | None:
-    """Tenta ler a worksheet 'METAS' da planilha escolhida."""
-    if worksheet_handle is None:
-        return None
-    try:
-        metas_ws = worksheet_handle.spreadsheet.worksheet("METAS")
-    except Exception:
-        return None
-
-    metas = pd.DataFrame(metas_ws.get_all_records())
-    if metas.empty:
-        return metas
-
-    metas.columns = [c.strip().upper() for c in metas.columns]
-    ren = {}
-    for cand in ["META_MENSAL", "META MEN SAL", "META_MEN SAL", "META_MEN.SAL", "META MENSA"]:
-        if cand in metas.columns: ren[cand] = "META_MENSAL"
-    for cand in ["DIAS UTEIS", "DIAS ÚTEIS", "DIAS_UTEIS"]:
-        if cand in metas.columns: ren[cand] = "DIAS_UTEIS"
-    metas = metas.rename(columns=ren)
-
-    metas["VISTORIADOR"] = metas["VISTORIADOR"].astype(str).str.upper().str.strip()
-    if "UNIDADE" in metas.columns:
-        metas["UNIDADE"] = metas["UNIDADE"].astype(str).str.upper().str.strip()
-    metas["TIPO"] = metas.get("TIPO", "").astype(str).str.upper().str.strip()
-
-    metas["META_MENSAL"] = pd.to_numeric(metas.get("META_MENSAL", 0), errors="coerce").fillna(0).astype(int)
-    metas["DIAS_UTEIS"]  = pd.to_numeric(metas.get("DIAS_UTEIS", 0),  errors="coerce").fillna(0).astype(int)
-    return metas
-
-# =========================
-# Conexão / escolha do mês (arquivo da pasta)
-# =========================
-st.markdown("#### Conexão com a Base — Planilhas na Pasta do Drive")
-
-# lista arquivos
-try:
-    arquivos = listar_planilhas_da_pasta(FOLDER_ID_OR_URL)
-except Exception as e:
-    st.error("Não consegui ler as planilhas da pasta.")
-    st.info(
-        "Verifique:\n"
-        "1) Se o FOLDER_ID é o ID ou a URL da pasta;\n"
-        f"2) Se a pasta/arquivos estão compartilhados com **{SERVICE_EMAIL}** (Leitor/Editor);\n"
-        "3) Se os arquivos são **Google Sheets** (não atalhos)."
-    )
-    with st.expander("Detalhes do erro"):
-        st.exception(e)
-    st.stop()
-
-if not arquivos:
-    st.error("Não encontrei Google Sheets na pasta (confira permissões e se não são atalhos).")
-    st.stop()
-
-# Selectbox para escolher o arquivo (mês) OU juntar todos
-opcoes = ["🧩 TODOS OS ARQUIVOS (juntar)"] + [f"{a['modifiedTime'][:10]} — {a['name']}" for a in arquivos]
-idx_default = 1  # default = o mais recente
-escolha = st.selectbox("Arquivo (mês) da pasta", opcoes, index=idx_default)
-
-# carrega planilhas
-df_raw_list = []
-metas_list = []
-sheet_ids_usados = []
-
-def _load_one(a):
-    ws, df0 = conectar_gsheets(a["id"])
-    metas0 = ler_aba_metas(ws)
-    return ws, df0, metas0
-
-if escolha.startswith("🧩"):
-    for a in arquivos:
-        try:
-            ws, df0, metas0 = _load_one(a)
-            if not df0.empty:
-                df0["__SRC_NOME__"] = a["name"]
-                df0["__SRC_ID__"] = a["id"]
-                df_raw_list.append(df0)
-                sheet_ids_usados.append(a["id"])
-            if metas0 is not None and not metas0.empty:
-                metas0["__SRC_ID__"] = a["id"]
-                metas_list.append(metas0)
-        except Exception as e:
-            with st.expander(f"Erro ao ler {a['name']}"):
-                st.exception(e)
-else:
-    escolhido = arquivos[opcoes.index(escolha) - 1]  # -1 por causa do "todos"
-    ws, df0, metas0 = _load_one(escolhido)
-    if not df0.empty:
-        df0["__SRC_NOME__"] = escolhido["name"]
-        df0["__SRC_ID__"] = escolhido["id"]
-        df_raw_list.append(df0)
-        sheet_ids_usados.append(escolhido["id"])
-    if metas0 is not None and not metas0.empty:
-        metas0["__SRC_ID__"] = escolhido["id"]
-        metas_list.append(metas0)
-
-# junta dados
-if len(df_raw_list) == 0:
-    st.error("Consegui abrir, mas a(s) planilha(s) não retornaram linhas.")
-    st.stop()
-
-df_raw = pd.concat(df_raw_list, ignore_index=True, sort=False)
-df_metas = pd.concat(metas_list, ignore_index=True, sort=False) if metas_list else None
-
-# Mensagem de conexão OK
-if escolha.startswith("🧩"):
-    st.success(f"✅ Conectado: {len(sheet_ids_usados)} planilhas (juntas).")
-else:
-    st.success(f"✅ Conectado: {escolhido['name']} (modificado em {escolhido['modifiedTime'][:10]})")
-
-# =========================
-# Limpeza e padronização
-# =========================
+# ==== helpers reutilizados ====
 def _upper_strip(x):
     return str(x).upper().strip() if pd.notna(x) else ""
 
@@ -289,67 +198,151 @@ def parse_date_any(x):
     try: return pd.to_datetime(s).date()
     except: return pd.NaT
 
-df = df_raw.copy()
-df.columns = [c.strip().upper() for c in df.columns]
+def ensure_numeric(df: pd.DataFrame, col: str, default=0):
+    """Garante coluna numérica segura (ou cria com default)."""
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(default)
+    else:
+        df[col] = default
+    return df
 
-col_unid  = "UNIDADE"   if "UNIDADE"   in df.columns else None
-col_data  = "DATA"      if "DATA"      in df.columns else None
-col_chassi= "CHASSI"    if "CHASSI"    in df.columns else None
-col_perito= "PERITO"    if "PERITO"    in df.columns else None
-col_digit = "DIGITADOR" if "DIGITADOR" in df.columns else None
+# --- Lê a aba METAS (opcional) ---
+def ler_aba_metas_from_spreadsheet(spreadsheet) -> pd.DataFrame | None:
+    """
+    Tenta ler a worksheet 'METAS' do objeto gspread.Spreadsheet.
+    Retorna DataFrame normalizado ou None.
+    """
+    try:
+        metas_ws = spreadsheet.worksheet("METAS")
+    except Exception:
+        return None
 
-required = [col_unid, col_data, col_chassi, (col_perito or col_digit)]
-if any(c is None for c in required):
-    st.error("A(s) planilha(s) precisam conter as colunas: UNIDADE, DATA, CHASSI, PERITO/DIGITADOR.")
+    metas = pd.DataFrame(metas_ws.get_all_records())
+    if metas.empty:
+        return metas
+
+    metas.columns = [c.strip().upper() for c in metas.columns]
+    ren = {}
+    # normalizações comuns
+    for cand in ["META_MENSAL", "META MEN SAL", "META_MEN SAL", "META_MEN.SAL", "META MENSA"]:
+        if cand in metas.columns: ren[cand] = "META_MENSAL"
+    for cand in ["DIAS UTEIS", "DIAS ÚTEIS", "DIAS_UTEIS"]:
+        if cand in metas.columns: ren[cand] = "DIAS_UTEIS"
+    metas = metas.rename(columns=ren)
+
+    metas["VISTORIADOR"] = metas["VISTORIADOR"].map(_upper_strip) if "VISTORIADOR" in metas.columns else ""
+    if "UNIDADE" in metas.columns:
+        metas["UNIDADE"] = metas["UNIDADE"].astype(str).map(_upper_strip)
+    metas["TIPO"] = metas.get("TIPO", "").astype(str).map(_upper_strip) if "TIPO" in metas.columns else ""
+
+    metas = ensure_numeric(metas, "META_MENSAL", 0).astype({"META_MENSAL": int})
+    metas = ensure_numeric(metas, "DIAS_UTEIS", 0).astype({"DIAS_UTEIS": int})
+    return metas
+
+# =========================
+# Conexão / escolha do mês (arquivo da pasta)
+# =========================
+st.markdown("#### Conexão com a Base — Planilhas na Pasta do Drive")
+
+try:
+    # só para exibir o e-mail do SA nas mensagens
+    _info, _ = _load_sa_info()
+    SERVICE_EMAIL = _info.get("client_email", "(sem client_email)")
+
+    arquivos = _drive_list_sheets_in_folder(FOLDER_ID)
+    if not arquivos:
+        raise RuntimeError("Não encontrei Google Sheets na pasta (confira permissões e se não são atalhos).")
+
+    # Opção para juntar tudo
+    opcoes = ["🟰 TODOS OS ARQUIVOS (juntar)"] + [f"{a['modifiedTime'][:10]} — {a['name']}" for a in arquivos]
+    escolha = st.selectbox("Arquivo (mês) da pasta", opcoes, index=1 if len(opcoes) > 1 else 0)
+
+    df_raw_list = []
+    ws_ref = None
+    metas_df = None
+
+    if escolha.startswith("🟰"):
+        # juntar tudo (concat)
+        for a in arquivos:
+            ws, df_tmp, sh = _connect_sheet(a["id"])
+            if ws_ref is None:
+                ws_ref = ws  # só para termos um handle válido se precisarmos
+                # tenta ler METAS da primeira planilha que tiver
+                metas_df = ler_aba_metas_from_spreadsheet(sh) or metas_df
+            df_raw_list.append(df_tmp)
+        if not df_raw_list:
+            raise RuntimeError("Não consegui ler nenhum arquivo da pasta.")
+        df_raw = pd.concat(df_raw_list, ignore_index=True)
+        st.success("✅ Conectado: TODOS os arquivos foram unidos.")
+    else:
+        escolhido = arquivos[opcoes.index(escolha) - 1]  # -1 por causa do "TODOS"
+        ws, df_raw, sh = _connect_sheet(escolhido["id"])
+        ws_ref = ws
+        metas_df = ler_aba_metas_from_spreadsheet(sh)
+        st.success(f"✅ Conectado: {escolhido['name']} (modificado em {escolhido['modifiedTime'][:10]})")
+
+except Exception as e:
+    st.error("Não consegui ler as planilhas da pasta.")
+    st.info(
+        "Verifique:\n"
+        f"1) Se o FOLDER_ID é o ID ou a URL da pasta;\n"
+        f"2) Se a pasta/arquivos estão compartilhados com **{SERVICE_EMAIL}** (Leitor/Editor);\n"
+        "3) Se os arquivos são **Google Sheets** (não atalhos quebrados)."
+    )
+    with st.expander("Detalhes do erro"):
+        st.exception(e)
     st.stop()
 
-# Normalizar
-df[col_unid]   = df[col_unid].map(_upper_strip)
-df[col_chassi] = df[col_chassi].map(_upper_strip)
-df["__DATA__"] = df[col_data].apply(parse_date_any)
-
-# VISTORIADOR
-if col_perito and col_digit:
-    df["VISTORIADOR"] = np.where(
-        df[col_perito].astype(str).str.strip() != "",
-        df[col_perito].map(_upper_strip),
-        df[col_digit].map(_upper_strip)
-    )
-elif col_perito:
-    df["VISTORIADOR"] = df[col_perito].map(_upper_strip)
-else:
-    df["VISTORIADOR"] = df[col_digit].map(_upper_strip)
-
-# Revistoria (ordem por data + chassi)
-df = df.sort_values(["__DATA__", col_chassi], kind="mergesort").reset_index(drop=True)
-df["__ORD__"] = df.groupby(col_chassi).cumcount()
-df["IS_REV"] = (df["__ORD__"] >= 1).astype(int)
-
-# Remover "POSTO CÓDIGO/CODIGO" e valores vazios de unidade
-BAN_UNIDS = {"POSTO CÓDIGO", "POSTO CODIGO", "CÓDIGO", "CODIGO", "", "—", "NAN"}
-df = df[~df[col_unid].isin(BAN_UNIDS)].copy()
-
 # =========================
-# Reset de filtros ao trocar de arquivo
+# Limpeza e padronização
 # =========================
-def _reset_filters_for_df(df_base: pd.DataFrame):
-    unidades_opts = sorted([u for u in df_base[col_unid].dropna().unique()])
-    vist_opts = sorted([v for v in df_base["VISTORIADOR"].dropna().unique() if v])
+def montar_df(df_raw: pd.DataFrame) -> pd.DataFrame:
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame()
 
-    datas_validas = [d for d in df_base["__DATA__"] if isinstance(d, date)]
-    dmin = min(datas_validas) if datas_validas else date.today()
-    dmax = max(datas_validas) if datas_validas else date.today()
+    df = df_raw.copy()
+    df.columns = [c.strip().upper() for c in df.columns]
 
-    st.session_state["unids_tmp"] = unidades_opts[:]      # seleciona todas por padrão? deixe vazio
-    st.session_state["vists_tmp"] = []                    # vazio
-    st.session_state["dt_ini"] = dmin
-    st.session_state["dt_fim"] = dmax
-    st.session_state["__data_token__"] = ",".join(sheet_ids_usados) or "ALL"
+    col_unid  = "UNIDADE"   if "UNIDADE"   in df.columns else None
+    col_data  = "DATA"      if "DATA"      in df.columns else None
+    col_chassi= "CHASSI"    if "CHASSI"    in df.columns else None
+    col_perito= "PERITO"    if "PERITO"    in df.columns else None
+    col_digit = "DIGITADOR" if "DIGITADOR" in df.columns else None
 
-# se mudou o arquivo, reseta datas/filtros
-token_atual = ",".join(sheet_ids_usados) or "ALL"
-if st.session_state.get("__data_token__") != token_atual:
-    _reset_filters_for_df(df)
+    required = [col_unid, col_data, col_chassi, (col_perito or col_digit)]
+    if any(c is None for c in required):
+        st.error("A planilha precisa conter as colunas: UNIDADE, DATA, CHASSI, PERITO/DIGITADOR.")
+        st.stop()
+
+    # Normalizar
+    df[col_unid]   = df[col_unid].map(_upper_strip)
+    df[col_chassi] = df[col_chassi].map(_upper_strip)
+    df["__DATA__"] = df[col_data].apply(parse_date_any)
+
+    # VISTORIADOR
+    if col_perito and col_digit:
+        df["VISTORIADOR"] = np.where(
+            df[col_perito].astype(str).str.strip() != "",
+            df[col_perito].map(_upper_strip),
+            df[col_digit].map(_upper_strip)
+        )
+    elif col_perito:
+        df["VISTORIADOR"] = df[col_perito].map(_upper_strip)
+    else:
+        df["VISTORIADOR"] = df[col_digit].map(_upper_strip)
+
+    # Revistoria (ordem por data + chassi)
+    df = df.sort_values(["__DATA__", col_chassi], kind="mergesort").reset_index(drop=True)
+    df["__ORD__"] = df.groupby(col_chassi).cumcount()
+    df["IS_REV"] = (df["__ORD__"] >= 1).astype(int)
+
+    # Remover "POSTO CÓDIGO/CODIGO" e valores vazios de unidade
+    BAN_UNIDS = {"POSTO CÓDIGO", "POSTO CODIGO", "CÓDIGO", "CODIGO", "", "—", "NAN"}
+    df = df[~df[col_unid].isin(BAN_UNIDS)].copy()
+
+    return df, col_unid, col_chassi
+
+df, col_unid, col_chassi = montar_df(df_raw)
 
 # =========================
 # Estado / Callbacks dos filtros
@@ -357,12 +350,10 @@ if st.session_state.get("__data_token__") != token_atual:
 def _init_state():
     st.session_state.setdefault("unids_tmp", [])
     st.session_state.setdefault("vists_tmp", [])
-    st.session_state.setdefault("dt_ini", None)
-    st.session_state.setdefault("dt_fim", None)
 _init_state()
 
-unidades_opts = sorted([u for u in df[col_unid].dropna().unique()])
-vist_opts = sorted([v for v in df["VISTORIADOR"].dropna().unique() if v])
+unidades_opts = sorted([u for u in df[col_unid].dropna().unique()]) if not df.empty else []
+vist_opts = sorted([v for v in df["VISTORIADOR"].dropna().unique() if v]) if not df.empty else []
 
 def cb_sel_all_vists():
     st.session_state.vists_tmp = vist_opts[:]
@@ -398,6 +389,15 @@ with colU2:
     b1.button("Selecionar todas (Unid.)", use_container_width=True, on_click=cb_sel_all_unids)
     b2.button("Limpar (Unid.)", use_container_width=True, on_click=cb_clear_unids)
 
+datas_validas = [d for d in df["__DATA__"] if isinstance(d, date)]
+dmin = min(datas_validas) if datas_validas else date.today()
+dmax = max(datas_validas) if datas_validas else date.today()
+
+if "dt_ini" not in st.session_state:
+    st.session_state["dt_ini"] = dmin
+if "dt_fim" not in st.session_state:
+    st.session_state["dt_fim"] = dmax
+
 colD1, colD2 = st.columns(2)
 with colD1:
     st.date_input("Data inicial", key="dt_ini", format="DD/MM/YYYY")
@@ -417,7 +417,7 @@ with colV2:
     b3.button("Selecionar todos", use_container_width=True, on_click=cb_sel_all_vists)
     b4.button("Limpar", use_container_width=True, on_click=cb_clear_vists)
 
-if st.button("🔄 Atualizar dados (recarregar)"):
+if st.button("🔄 Atualizar dados da pasta (recarregar)"):
     st.cache_data.clear()
     st.rerun()
 
@@ -480,10 +480,12 @@ def _is_workday(d):
 def _calc_wd_passados(df_view: pd.DataFrame) -> pd.DataFrame:
     if df_view.empty or "__DATA__" not in df_view.columns or "VISTORIADOR" not in df_view.columns:
         return pd.DataFrame(columns=["VISTORIADOR", "DIAS_PASSADOS"])
+
     mask = df_view["__DATA__"].apply(_is_workday)
     if not mask.any():
         vists = df_view["VISTORIADOR"].dropna().unique()
         return pd.DataFrame({"VISTORIADOR": vists, "DIAS_PASSADOS": np.zeros(len(vists), dtype=int)})
+
     out = (df_view.loc[mask]
            .groupby("VISTORIADOR")["__DATA__"]
            .nunique()
@@ -497,26 +499,14 @@ grp = grp.merge(wd_passados, on="VISTORIADOR", how="left")
 grp["DIAS_PASSADOS"] = grp["DIAS_PASSADOS"].fillna(0).astype(int)
 
 # ---- junta METAS (se existir a aba)
-if df_metas is not None and len(df_metas):
-    metas_cols = [c for c in ["VISTORIADOR", "UNIDADE", "TIPO", "META_MENSAL", "DIAS_UTEIS"] if c in df_metas.columns]
-    metas_use = df_metas[metas_cols].copy()
-    # padroniza
-    metas_use["VISTORIADOR"] = metas_use["VISTORIADOR"].astype(str).str.upper().str.strip()
-    if "UNIDADE" in metas_use.columns:
-        metas_use["UNIDADE"] = metas_use["UNIDADE"].astype(str).str.upper().str.strip()
-    if "TIPO" in metas_use.columns:
-        metas_use["TIPO"] = metas_use["TIPO"].astype(str).str.upper().replace({"MOVEL": "MÓVEL"})
-    for c in ["META_MENSAL", "DIAS_UTEIS"]:
-        if c in metas_use.columns:
-            metas_use[c] = pd.to_numeric(metas_use[c], errors="coerce").fillna(0)
-    grp = grp.merge(metas_use, on="VISTORIADOR", how="left")
+if metas_df is not None and len(metas_df):
+    metas_cols = [c for c in ["VISTORIADOR", "UNIDADE", "TIPO", "META_MENSAL", "DIAS_UTEIS"] if c in metas_df.columns]
+    grp = grp.merge(metas_df[metas_cols], on="VISTORIADOR", how="left")
 
     grp["UNIDADE"] = grp.get("UNIDADE", "").fillna("")
-    grp["TIPO"]     = grp.get("TIPO", "").fillna("")
-    for c in ["META_MENSAL", "DIAS_UTEIS"]:
-        grp[c] = pd.to_numeric(grp.get(c), errors="coerce").fillna(0)
-    grp["META_MENSAL"] = grp["META_MENSAL"].astype(int)
-    grp["DIAS_UTEIS"]  = grp["DIAS_UTEIS"].astype(int)
+    grp["TIPO"]    = grp.get("TIPO", "").fillna("")
+    grp = ensure_numeric(grp, "META_MENSAL", 0).astype({"META_MENSAL": int})
+    grp = ensure_numeric(grp, "DIAS_UTEIS", 0).astype({"DIAS_UTEIS": int})
 else:
     grp["TIPO"] = ""
     grp["META_MENSAL"] = 0
@@ -710,13 +700,13 @@ else:
     prod_mes["LIQUIDO"] = prod_mes["VISTORIAS"] - prod_mes["REVISTORIAS"]
 
     # metas por vistoriador (TIPO, META_MENSAL)
-    if df_metas is not None and len(df_metas):
-        metas_join = df_metas[["VISTORIADOR", "TIPO", "META_MENSAL"]].copy() if "TIPO" in df_metas.columns else df_metas[["VISTORIADOR", "META_MENSAL"]].copy()
+    if metas_df is not None and len(metas_df):
+        metas_join = metas_df[["VISTORIADOR", "TIPO", "META_MENSAL"]].copy() if "TIPO" in metas_df.columns else metas_df[["VISTORIADOR","META_MENSAL"]].copy()
     else:
         metas_join = pd.DataFrame(columns=["VISTORIADOR", "TIPO", "META_MENSAL"])
 
     base_mes = prod_mes.merge(metas_join, on="VISTORIADOR", how="left")
-    base_mes["TIPO"] = base_mes.get("TIPO", "").astype(str).str.upper().replace({"MOVEL":"MÓVEL"}).replace("", "—")
+    base_mes["TIPO"] = base_mes.get("TIPO", "").astype(str).map(_upper_strip).replace({"MOVEL": "MÓVEL"}).replace("", "—")
     base_mes["META_MENSAL"] = pd.to_numeric(base_mes.get("META_MENSAL", 0), errors="coerce").fillna(0)
 
     # % de atingimento (sobre o REALIZADO GERAL)
@@ -863,13 +853,14 @@ else:
     prod_dia["LIQUIDO_DIA"] = prod_dia["VISTORIAS_DIA"] - prod_dia["REVISTORIAS_DIA"]
 
     # metas (para META_DIA) vindas da aba METAS
-    if (df_metas is not None) and len(df_metas):
-        metas_join = df_metas[["VISTORIADOR", "TIPO", "META_MENSAL", "DIAS_UTEIS"]].copy() if set(["TIPO","DIAS_UTEIS"]).issubset(df_metas.columns) else pd.DataFrame(columns=["VISTORIADOR","TIPO","META_MENSAL","DIAS_UTEIS"])
+    if (metas_df is not None) and len(metas_df):
+        metas_join = metas_df[["VISTORIADOR", "TIPO", "META_MENSAL", "DIAS_UTEIS"]].copy() \
+                     if "TIPO" in metas_df.columns else metas_df[["VISTORIADOR","META_MENSAL","DIAS_UTEIS"]].copy()
     else:
         metas_join = pd.DataFrame(columns=["VISTORIADOR", "TIPO", "META_MENSAL", "DIAS_UTEIS"])
 
     base_dia = prod_dia.merge(metas_join, on="VISTORIADOR", how="left")
-    base_dia["TIPO"] = base_dia.get("TIPO", "").astype(str).str.upper().replace({"MOVEL": "MÓVEL"}).replace("", "—")
+    base_dia["TIPO"] = base_dia.get("TIPO","").astype(str).str.upper().replace({"MOVEL": "MÓVEL"}).replace("", "—")
     for c in ["META_MENSAL", "DIAS_UTEIS"]:
         base_dia[c] = pd.to_numeric(base_dia.get(c, 0), errors="coerce").fillna(0)
 
