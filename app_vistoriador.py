@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # ------------------------------------------------------------
 # Painel de Produção por Vistoriador (Streamlit) - MULTI-MESES
-# Agora sem UI de "Regras", sem "Conexão com a Base" na tela e
-# sem seleção visual de meses/links. Lê silenciosamente o índice.
+# Sem UI inicial de conexão/meses. Agora com filtro FIXO/MÓVEL
+# específico para a tabela "Resumo por Vistoriador".
 # ------------------------------------------------------------
 
 import os, re, json
@@ -24,11 +24,10 @@ st.set_page_config(page_title="🧰 Produção por Vistoriador - Starcheck (mult
 st.title("🧰 Painel de Produção por Vistoriador - Starcheck")
 
 # === Planilha-Índice (ARQUIVOS) ===
-# Troque pelo ID da SUA planilha "ÍNDICE_MESES":
 INDEX_SHEET_ID = "1x0ByDHL_UH55r-KIc_gvMcg9YxonTwhJ3NKmpipnQ3I"
 INDEX_TAB_NAME = "ARQUIVOS"
 
-# --- estilos essenciais (sem o bloco 'hero' e sem regras) ---
+# --- estilos essenciais ---
 st.markdown("""
 <style>
   .notranslate { unicode-bidi: plaintext; }
@@ -214,26 +213,23 @@ def _yes(v) -> bool:
     return str(v).strip().upper() in {"S", "SIM", "TRUE", "T", "1", "Y", "YES"}
 
 def load_ids_from_index(gs_client) -> List[str]:
-    """Lê a planilha-índice e retorna IDs ATIVOS (sem exibir UI)."""
     try:
         sh = gs_client.open_by_key(INDEX_SHEET_ID)
         ws = sh.worksheet(INDEX_TAB_NAME)
-        rows = ws.get_all_records()  # [{'URL':..., 'MÊS':..., 'ATIVO':...}, ...]
-        if not rows:
-            return []
+        rows = ws.get_all_records()
+        if not rows: return []
         norm = [{str(k).strip().upper(): r[k] for k in r} for r in rows]
         ativos = [r for r in norm if _yes(r.get("ATIVO", "S"))]
         ids = []
         for r in ativos:
             sid = extract_sheet_id(str(r.get("URL","")))
-            if sid:
-                ids.append(sid)
+            if sid: ids.append(sid)
         return ids
     except Exception:
         return []
 
 # =========================
-# Entrada – múltiplas planilhas (sempre via índice, sem UI)
+# Entrada – múltiplas planilhas (sempre via índice)
 # =========================
 client = make_client()
 sheet_ids: List[str] = load_ids_from_index(client)
@@ -242,7 +238,6 @@ if not sheet_ids:
     st.error("Não encontrei dados ativos no índice. Verifique o compartilhamento/ATIVO na planilha-índice.")
     st.stop()
 
-# carrega todas (sem mensagens de sucesso/erro na UI)
 all_df, all_metas = [], []
 for sid in sheet_ids:
     try:
@@ -250,7 +245,6 @@ for sid in sheet_ids:
         if not dfi.empty: all_df.append(dfi)
         if not dmf.empty: all_metas.append(dmf)
     except Exception:
-        # Falhou uma planilha? Ignora silenciosamente para não poluir a UI do gestor.
         pass
 
 if len(all_df) == 0:
@@ -261,7 +255,7 @@ df = pd.concat(all_df, ignore_index=True)
 df_metas_all = pd.concat(all_metas, ignore_index=True) if len(all_metas) else pd.DataFrame()
 
 # =========================
-# Continuação (igual ao seu painel)
+# Continuação
 # =========================
 orig_cols = [c for c in df.columns]
 col_unid  = "UNIDADE" if "UNIDADE" in orig_cols else None
@@ -281,15 +275,12 @@ vist_opts = sorted([v for v in df["VISTORIADOR"].dropna().unique() if v])
 def cb_sel_all_vists():
     st.session_state.vists_tmp = vist_opts[:]
     st.rerun()
-
 def cb_clear_vists():
     st.session_state.vists_tmp = []
     st.rerun()
-
 def cb_sel_all_unids():
     st.session_state.unids_tmp = unidades_opts[:]
     st.rerun()
-
 def cb_clear_unids():
     st.session_state.unids_tmp = []
     st.rerun()
@@ -331,7 +322,7 @@ with colV2:
     b4.button("Limpar", use_container_width=True, on_click=cb_clear_vists)
 
 # =========================
-# Aplicar filtros
+# Aplicar filtros globais
 # =========================
 view = df.copy()
 if st.session_state.unids_tmp:
@@ -361,7 +352,7 @@ cards = [
 st.markdown('<div class="card-container">' + "".join([f"<div class=\'card\'><h4>{t}</h4><h2>{v}</h2></div>" for t, v in cards]) + "</div>", unsafe_allow_html=True)
 
 # =========================
-# Resumo por Vistoriador
+# Resumo por Vistoriador  (AGORA COM FILTRO FIXO/MÓVEL)
 # =========================
 st.markdown("<div class='section-title'>📋 Resumo por Vistoriador</div>", unsafe_allow_html=True)
 
@@ -431,10 +422,27 @@ grp["MEDIA_DIA_ATUAL"] = np.where(grp["DIAS_PASSADOS"]>0, grp["LIQUIDO"]/grp["DI
 grp["PROJECAO_MES"] = (grp["LIQUIDO"] + grp["MEDIA_DIA_ATUAL"] * grp["DIAS_RESTANTES"]).round(0)
 grp["TENDENCIA_%"] = np.where(grp["META_MENSAL"]>0, (grp["PROJECAO_MES"]/grp["META_MENSAL"])*100, np.nan)
 
-grp = grp.sort_values(["PROJECAO_MES","LIQUIDO"], ascending=[False, False])
+# ---- NORMALIZAÇÃO DO TIPO + FILTRO SÓ PARA ESTA TABELA
+grp["TIPO_NORM"] = grp.get("TIPO","").astype(str).str.upper().str.replace("MOVEL","MÓVEL").str.strip()
+grp.loc[grp["TIPO_NORM"]=="", "TIPO_NORM"] = "—"
+
+tipo_options = [t for t in ["FIXO","MÓVEL"] if t in grp["TIPO_NORM"].unique().tolist()]
+if "—" in grp["TIPO_NORM"].unique():  # caso existam metas sem tipo
+    tipo_options.append("—")
+
+sel_tipos = st.multiselect(
+    "Tipo (filtro apenas desta tabela)",
+    options=tipo_options,
+    default=tipo_options,
+    key="resumo_tipo_filter"
+)
+grp_tbl = grp if not sel_tipos else grp[grp["TIPO_NORM"].isin(sel_tipos)]
+
+# ---- ordenação
+grp_tbl = grp_tbl.sort_values(["PROJECAO_MES","LIQUIDO"], ascending=[False, False])
 
 # ---- formatação (com emojis)
-fmt = grp.copy()
+fmt = grp_tbl.copy()
 
 def chip_tend(p):
     if pd.isna(p): return "—"
@@ -451,7 +459,7 @@ def chip_nec(x):
         return "—"
     return "0 ✅" if v <= 0 else f"{int(round(v))} 🔥"
 
-fmt["TIPO"] = fmt.get("TIPO","").map({"FIXO":"🏢 FIXO","MÓVEL":"🚗 MÓVEL","MOVEL":"🚗 MÓVEL"}).fillna("—")
+fmt["TIPO"] = fmt["TIPO_NORM"].map({"FIXO":"🏢 FIXO","MÓVEL":"🚗 MÓVEL"}).fillna("—")
 fmt["META_MENSAL"]      = fmt["META_MENSAL"].map(lambda x: f"{int(x):,}".replace(",", "."))
 fmt["DIAS_UTEIS"]       = fmt["DIAS_UTEIS"].map(lambda x: f"{int(x)}")
 fmt["META_DIA"]         = fmt["META_DIA"].map(lambda x: f"{x:,.1f}".replace(",", "X").replace(".", ",").replace("X","."))
@@ -459,8 +467,8 @@ fmt["VISTORIAS"]        = fmt["VISTORIAS"].map(lambda x: f"{int(x)}")
 fmt["REVISTORIAS"]      = fmt["REVISTORIAS"].map(lambda x: f"{int(x)}")
 fmt["LIQUIDO"]          = fmt["LIQUIDO"].map(lambda x: f"{int(x)}")
 fmt["FALTANTE_MES"]     = fmt["FALTANTE_MES"].map(lambda x: f"{int(x)}")
-fmt["NECESSIDADE_DIA"]  = grp["NECESSIDADE_DIA"].apply(chip_nec)
-fmt["TENDÊNCIA"]        = grp["TENDENCIA_%"].apply(chip_tend)
+fmt["NECESSIDADE_DIA"]  = fmt["NECESSIDADE_DIA"].apply(chip_nec)
+fmt["TENDÊNCIA"]        = fmt["TENDENCIA_%"].apply(chip_tend)
 fmt["PROJECAO_MES"]     = fmt["PROJECAO_MES"].map(lambda x: "—" if pd.isna(x) else f"{int(round(x))}")
 
 cols_show = [
@@ -482,7 +490,6 @@ else:
 # Evolução diária
 # =========================
 st.markdown("<div class='section-title'>📈 Evolução diária</div>", unsafe_allow_html=True)
-
 if view.empty:
     st.caption("Sem dados no período selecionado.")
 else:
@@ -582,7 +589,6 @@ else:
                 .agg(VISTORIAS=("IS_REV","size"), REVISTORIAS=("IS_REV","sum")).reset_index())
     prod_mes["LIQUIDO"] = prod_mes["VISTORIAS"] - prod_mes["REVISTORIAS"]
 
-    # metas do mês ref
     if not df_metas_all.empty:
         metas_join = df_metas_all[df_metas_all["__YM__"] == f"{ref_ano}-{ref_mes:02d}"][["VISTORIADOR","TIPO","META_MENSAL"]].copy()
     else:
