@@ -16,6 +16,7 @@ import altair as alt
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from calendar import monthrange
 
 # =========================
 # CONFIG BÁSICA
@@ -368,24 +369,6 @@ grp = (view
 
 grp["LIQUIDO"] = grp["VISTORIAS"] - grp["REVISTORIAS"]
 
-def _is_workday(d):
-    return isinstance(d, date) and d.weekday() < 5
-
-def _calc_wd_passados(df_view: pd.DataFrame) -> pd.DataFrame:
-    if df_view.empty or "__DATA__" not in df_view.columns or "VISTORIADOR" not in df_view.columns:
-        return pd.DataFrame(columns=["VISTORIADOR", "DIAS_PASSADOS"])
-    mask = df_view["__DATA__"].apply(_is_workday)
-    if not mask.any():
-        vists = df_view["VISTORIADOR"].dropna().unique()
-        return pd.DataFrame({"VISTORIADOR": vists, "DIAS_PASSADOS": np.zeros(len(vists), dtype=int)})
-    out = (df_view.loc[mask].groupby("VISTORIADOR")["__DATA__"].nunique().reset_index().rename(columns={"__DATA__": "DIAS_PASSADOS"}))
-    out["DIAS_PASSADOS"] = out["DIAS_PASSADOS"].astype(int)
-    return out
-
-wd_passados = _calc_wd_passados(view)
-grp = grp.merge(wd_passados, on="VISTORIADOR", how="left").fillna({"DIAS_PASSADOS":0})
-grp["DIAS_PASSADOS"] = grp["DIAS_PASSADOS"].astype(int)
-
 # ---- METAS: usar o mês ref mais recente dentro do filtro
 if not view.empty:
     ref = max([d for d in view["__DATA__"] if isinstance(d, date)])
@@ -413,21 +396,44 @@ for c in ["META_MENSAL","DIAS_UTEIS"]:
 grp["META_MENSAL"] = grp["META_MENSAL"].astype(int)
 grp["DIAS_UTEIS"]  = grp["DIAS_UTEIS"].astype(int)
 
-# ---- cálculos
+# ---- DIAS ÚTEIS PASSADOS DO MÊS (iguais para todos)
+if not view.empty:
+    ref_ano, ref_mes = ref.year, ref.month
+    start_month = date(ref_ano, ref_mes, 1)
+    # np.busday_count é exclusivo do fim; somamos 1 dia
+    dias_passados_mes = int(np.busday_count(start_month, ref + pd.Timedelta(days=1), weekmask='Mon Tue Wed Thu Fri'))
+else:
+    dias_passados_mes = 0
+
+grp["DIAS_PASSADOS_MES"] = dias_passados_mes
+
+# ---- cálculos (baseados em VISTORIAS GERAIS)
 grp["META_DIA"] = np.where(grp["DIAS_UTEIS"]>0, grp["META_MENSAL"]/grp["DIAS_UTEIS"], 0.0)
-grp["FALTANTE_MES"] = np.maximum(grp["META_MENSAL"] - grp["LIQUIDO"], 0)
-grp["DIAS_RESTANTES"] = np.maximum(grp["DIAS_UTEIS"] - grp["DIAS_PASSADOS"], 0)
-grp["NECESSIDADE_DIA"] = np.where(grp["DIAS_RESTANTES"]>0, grp["FALTANTE_MES"]/grp["DIAS_RESTANTES"], 0.0)
-grp["MEDIA_DIA_ATUAL"] = np.where(grp["DIAS_PASSADOS"]>0, grp["LIQUIDO"]/grp["DIAS_PASSADOS"], 0.0)
-grp["PROJECAO_MES"] = (grp["LIQUIDO"] + grp["MEDIA_DIA_ATUAL"] * grp["DIAS_RESTANTES"]).round(0)
+
+# faltante: meta x VISTORIAS (geral)
+grp["FALTANTE_MES"] = np.maximum(grp["META_MENSAL"] - grp["VISTORIAS"], 0)
+
+# dias restantes: DIAS_UTEIS - dias úteis passados do mês (globais)
+grp["DIAS_RESTANTES"] = np.maximum(grp["DIAS_UTEIS"] - grp["DIAS_PASSADOS_MES"], 0)
+
+# média/dia atual baseada no GERAL
+grp["MEDIA_DIA_ATUAL"] = np.where(grp["DIAS_PASSADOS_MES"]>0, grp["VISTORIAS"]/grp["DIAS_PASSADOS_MES"], 0.0)
+
+# projeção do mês baseada no GERAL
+grp["PROJECAO_MES"] = (grp["VISTORIAS"] + grp["MEDIA_DIA_ATUAL"] * grp["DIAS_RESTANTES"]).round(0)
+
+# tendência contra a meta
 grp["TENDENCIA_%"] = np.where(grp["META_MENSAL"]>0, (grp["PROJECAO_MES"]/grp["META_MENSAL"])*100, np.nan)
+
+# necessidade/dia (permanece)
+grp["NECESSIDADE_DIA"] = np.where(grp["DIAS_RESTANTES"]>0, grp["FALTANTE_MES"]/grp["DIAS_RESTANTES"], 0.0)
 
 # ---- NORMALIZAÇÃO DO TIPO + FILTRO SÓ PARA ESTA TABELA
 grp["TIPO_NORM"] = grp.get("TIPO","").astype(str).str.upper().str.replace("MOVEL","MÓVEL").str.strip()
 grp.loc[grp["TIPO_NORM"]=="", "TIPO_NORM"] = "—"
 
 tipo_options = [t for t in ["FIXO","MÓVEL"] if t in grp["TIPO_NORM"].unique().tolist()]
-if "—" in grp["TIPO_NORM"].unique():  # caso existam metas sem tipo
+if "—" in grp["TIPO_NORM"].unique():  # metas sem tipo
     tipo_options.append("—")
 
 sel_tipos = st.multiselect(
@@ -439,7 +445,7 @@ sel_tipos = st.multiselect(
 grp_tbl = grp if not sel_tipos else grp[grp["TIPO_NORM"].isin(sel_tipos)]
 
 # ---- ordenação
-grp_tbl = grp_tbl.sort_values(["PROJECAO_MES","LIQUIDO"], ascending=[False, False])
+grp_tbl = grp_tbl.sort_values(["PROJECAO_MES","VISTORIAS"], ascending=[False, False])
 
 # ---- formatação (com emojis)
 fmt = grp_tbl.copy()
